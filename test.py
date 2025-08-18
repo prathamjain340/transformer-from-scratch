@@ -3,6 +3,7 @@ import re
 from collections import Counter
 from datasets import load_dataset
 import os
+import json
 
 class Tokenizer:
     def __init__(self, vocab_size=1000, unk_token="<UNK>", pad_token="<PAD>"):
@@ -15,9 +16,11 @@ class Tokenizer:
         return re.findall(r"[a-z0-9]+", text.lower())
     
     def fit(self, texts):
-        # Tokenize each sentence
-        all_tokens = [tok for text in texts for tok in self.tokenize(text)]
-        freq = Counter(all_tokens)
+        # memory efficiency
+        freq = Counter()
+        for text in texts:
+            tokens = self.tokenize(text)
+            freq.update(tokens)
 
         # Sort by frequency (high to low), then alphabetically
         most_common = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))
@@ -51,6 +54,55 @@ class Tokenizer:
             mask.append(mask_seq)
 
         return np.array(padded, dtype=np.int32), np.array(mask, dtype=np.float32)
+    
+    def save(self, folder_path):
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+        
+        # save the word -> id mapping
+        with open(os.path.join(folder_path, "word2id.json"), "w") as f:
+            json.dump(self.word2id, f)
+
+        # save the config
+        config = {
+            "vocab_size" : self.vocab_size,
+            "unk_token" : self.unk_token,
+            "pad_token" : self.pad_token
+        }
+
+        with open(os.path.join(folder_path, "config.json"), "w") as f:
+            json.dump(config, f)
+
+    @classmethod
+    def load(cls, folder_path):
+        # load the config
+        with open(os.path.join(folder_path, "config.json"), "r") as f:
+            config = json.load(f)
+
+        # create a new tokenizer with the saved config
+        tokenizer = cls(
+            vocab_size = config["vocab_size"],
+            unk_token = config["unk_token"],
+            pad_token = config["pad_token"]
+        )
+
+        # load the word -> id mapping
+        with open(os.path.join(folder_path, "word2id.json"), "r") as f:
+            # rebuild the rest of the tokenizer's state
+            tokenizer.word2id = json.load(f)
+
+        # create an empty list of the correct size
+        id2word_list = [None] * len(tokenizer.word2id)
+        # populate the list using the loaded dictionary
+        for word, idx in tokenizer.word2id.items():
+            id2word_list[idx] = word
+        tokenizer.id2word = id2word_list
+
+        # rebuild the rest of the tokenizer's state
+        tokenizer.pad_id = tokenizer.word2id[tokenizer.pad_token]
+        tokenizer.unk_id = tokenizer.word2id[tokenizer.unk_token]
+
+        return tokenizer
 
 # Embedding Layer
 class Embedding:
@@ -731,14 +783,28 @@ def custom_text_pred(model, embedding, pos_embed, norm1, attention, norm2, ffn, 
 
 # Main
 
+# load data
 dataset = load_dataset("ag_news")
 train_data = dataset["train"].select(range(10000))
 texts = [item["text"] for item in train_data]
 labels = [item["label"] for item in train_data]
 
-# Fit tokenizer
-tok = Tokenizer()
-tok.fit(texts)
+# checkpoint and tokenizer loading/fitting
+checkpoint_path = "model_checkpoint.npz"
+tokenizer_path = "tokenizer_files"
+current_num_samples = len(texts)
+
+if os.path.exists(checkpoint_path) and os.path.exists(tokenizer_path):
+    print("Loading tokenizer from file...")
+    tok = Tokenizer.load(tokenizer_path)
+    should_train = True # assume we might need to retrain, check model checkpoint next
+
+else:
+    print("No tokenizer found. Fitting a new one.")
+    tok = Tokenizer()
+    tok.fit(texts) # memory efficient version
+    tok.save(tokenizer_path)
+    should_train = True # we must train if we made a new tokenizer
 
 # Encode + pad to a fixed length
 X_ids, mask = tok.encode_batch(texts, max_len = 20)
@@ -821,8 +887,10 @@ if os.path.exists("model_checkpoint.npz"):
         should_train = False
     else:
         print("Checkpoint invalid (dataset changed). Retraining...")
+        should_train = True
 else:
     print("No checkpoint found. Training model from scratch.")
+    should_train = True
 
 if should_train:
     dropout.is_training = True # ensure dropout is ON for training
@@ -963,22 +1031,13 @@ if should_train:
                     "num_samples" : current_num_samples,
                 }
 
-                # add final weight classifier weights
+                # add final classifier weights
                 for i, (layer, _) in enumerate(model.layers):
                     save_dict[f"W{i}"] = layer.W
                     save_dict[f"b{i}"] = layer.b
 
                 np.savez("model_checkpoint.npz", **save_dict)
-
-
-                # np.savez("model_checkpoint.npz",
-                #          embed_weights = embedding.embedding,
-                #          pos_weights = pos_embed.embedding,
-                #          num_samples = current_num_samples,
-                #          **{f"W{i}": layer.W for i, (layer, _) in enumerate(model.layers)},
-                #          **{f"b{i}": layer.b for i, (layer, _) in enumerate(model.layers)},
-                #          )
-            
+                tok.save(tokenizer_path)
             dropout.is_training = True # try it back ON for the next training epoch
 
 
@@ -990,7 +1049,7 @@ test_labels = dataset["test"]["label"][:20]
 
 # visualize_predictions(model, embedding, pos_embed, pooling, tok, test_texts, test_labels, id2label)
 
-custom_text = "income interest usa interest income"
+custom_text = "rocket jupiter nasa nasa rocket moon interest usa interest income"
 dropout.is_training = False
 custom_text_pred(model, embedding, pos_embed, norm1, attention, norm2, ffn, pooling, dropout, tok, custom_text, id2label)
 
