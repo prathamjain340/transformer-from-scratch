@@ -1,3 +1,7 @@
 own.py
 
 ahem.py
+
+*.npz
+
+tokenizer_files/
