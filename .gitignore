@@ -4,4 +4,4 @@ ahem.py
 
 *.npz
 
-tokenizer_files/
+decoder_tokenizer_files/

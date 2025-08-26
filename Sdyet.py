@@ -6,10 +6,12 @@ import os
 import json
 
 class Tokenizer:
-    def __init__(self, vocab_size=1000, unk_token="<UNK>", pad_token="<PAD>"):
+    def __init__(self, vocab_size=5000, unk_token="<UNK>", pad_token="<PAD>", start_token="<START>", end_token="<END>"):
         self.vocab_size = vocab_size
         self.unk_token = unk_token
         self.pad_token = pad_token
+        self.start_token = start_token
+        self.end_token = end_token
 
     def tokenize(self, text):
         # Convert to lowercase and split on words (removes punctuation)
@@ -24,17 +26,20 @@ class Tokenizer:
 
         # Sort by frequency (high to low), then alphabetically
         most_common = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))
-        most_common = most_common[:self.vocab_size - 2]  # save space for UNK, PAD
+        most_common = most_common[:self.vocab_size - 4]  # save space for UNK, PAD, START, END
 
         # Assign IDs
-        self.id2word = [self.pad_token, self.unk_token] + [w for w, _ in most_common]
+        self.id2word = [self.pad_token, self.unk_token, self.start_token, self.end_token] + [w for w, _ in most_common]
         self.word2id = {w: i for i, w in enumerate(self.id2word)}
 
         self.pad_id = self.word2id[self.pad_token]
         self.unk_id = self.word2id[self.unk_token]
+        self.start_id = self.word2id[self.start_token]
+        self.end_id = self.word2id[self.end_token]
 
     def encode(self, text):
-        return [self.word2id.get(tok, self.unk_id) for tok in self.tokenize(text)]
+        tokens = [self.word2id.get(tok, self.unk_id) for tok in self.tokenize(text)]
+        return [self.start_id] + tokens + [self.end_id]
 
     def encode_batch(self, texts, max_len = None):
         encoded = [self.encode(text) for text in texts]
@@ -67,7 +72,9 @@ class Tokenizer:
         config = {
             "vocab_size" : self.vocab_size,
             "unk_token" : self.unk_token,
-            "pad_token" : self.pad_token
+            "pad_token" : self.pad_token,
+            "start_token" : self.start_token,
+            "end_token" : self.end_token
         }
 
         with open(os.path.join(folder_path, "config.json"), "w") as f:
@@ -83,7 +90,9 @@ class Tokenizer:
         tokenizer = cls(
             vocab_size = config["vocab_size"],
             unk_token = config["unk_token"],
-            pad_token = config["pad_token"]
+            pad_token = config["pad_token"],
+            start_token = config["start_token"],
+            end_token = config["end_token"]
         )
 
         # load the word -> id mapping
@@ -101,6 +110,8 @@ class Tokenizer:
         # rebuild the rest of the tokenizer's state
         tokenizer.pad_id = tokenizer.word2id[tokenizer.pad_token]
         tokenizer.unk_id = tokenizer.word2id[tokenizer.unk_token]
+        tokenizer.start_id = tokenizer.word2id[tokenizer.start_token]
+        tokenizer.end_id = tokenizer.word2id[tokenizer.end_token]
 
         return tokenizer
 
@@ -142,17 +153,18 @@ class PositionalEmbedding:
         self.embedding = np.random.randn(max_len, embedding_dim) * 0.01
 
     def forward(self, x):
-        self.input_shape = x.shape
+        # self.input_shape = x.shape
         self.batch_size, self.seq_len, self.embedding_dim = x.shape
-        self.pos_embed = self.embedding[:self.seq_len]
+        self.pos_embed = self.embedding[:self.seq_len, :]
         self.pos_embed_batched = np.tile(self.pos_embed, (self.batch_size, 1, 1))
         return x + self.pos_embed_batched
 
     def backward(self, grad_output):
+        _, seq_len, _ = grad_output.shape
         # Gradient w.r.t the positional embedding is just the sum over batches
         self.d_embedding = np.zeros_like(self.embedding)
-        for i in range(self.seq_len):
-            self.d_embedding[i] = grad_output[:, i, :].sum(axis = 0)
+        for i in range(seq_len):
+            self.d_embedding[i, :] = grad_output[:, i, :].sum(axis = 0)
         return grad_output
     
     def update(self, learning_rate):
@@ -160,104 +172,6 @@ class PositionalEmbedding:
         self.d_embedding = clip_gradients(self.d_embedding, clip_threshold)
 
         self.embedding -= learning_rate * self.d_embedding
-
-# Self Attention
-# class SelfAttention:
-#     def __init__(self, embed_dim):
-#         self.embed_dim = embed_dim
-#         self.scale = np.sqrt(self.embed_dim).astype(np.float32)
-
-#         # weight matrices for Q, K, V (each D x D)
-#         self.W_q = np.random.randn(embed_dim, embed_dim) / np.sqrt(embed_dim) * 0.1
-#         self.W_k = np.random.randn(embed_dim, embed_dim) / np.sqrt(embed_dim) * 0.1
-#         self.W_v = np.random.randn(embed_dim, embed_dim) / np.sqrt(embed_dim) * 0.1
-
-#         # gradients
-#         self.dW_q = np.zeros_like(self.W_q)
-#         self.dW_k = np.zeros_like(self.W_k)
-#         self.dW_v = np.zeros_like(self.W_v)
-
-#     def forward(self, x, mask):
-#         self.x = x
-#         self.mask = mask
-#         B, T, D = x.shape
-        
-#         # compute Q, K, V
-#         self.Q = x @ self.W_q
-#         self.K = x @ self.W_k
-#         self.V = x @ self.W_v
-
-#         # attention scores
-#         scores = self.Q @ self.K.transpose(0, 2, 1) / self.scale
-
-#         # mask padding (set attention to -inf where mask is 0)
-#         mask_expanded = mask[:, np.newaxis, :]
-#         scores = np.where(mask_expanded == 0, -1e9, scores)
-#         scores = np.nan_to_num(scores, nan=-1e9, posinf=1e9, neginf=-1e9)
-
-#         # softmax attention weights
-#         self.attn_weights = np.exp(scores - np.max(scores, axis = 2, keepdims=True))
-#         self.attn_weights /= np.sum(self.attn_weights, axis = 2, keepdims=True) + 1e-8
-
-#         # output: weighted sum of V
-#         self.out = self.attn_weights @ self.V
-#         return self.out
-    
-#     def backward(self, grad_output):
-#         # B, T, D = self.x.shape
-#         B, T, D = grad_output.shape
-
-#         # dV = attn_weights^T @ d_out
-#         dV = self.attn_weights.transpose(0, 2, 1) @ grad_output
-        
-#         # d_attn_weights @ V^T
-#         d_attn = grad_output @ self.V.transpose(0, 2, 1)
-
-#         # softmax backward
-#         dscores = self.attn_weights * (d_attn - np.sum(d_attn * self.attn_weights, axis = 2, keepdims=True))
-
-#         # divide by scale
-#         dscores /= self.scale
-
-#         # gradients for Q and K
-#         dQ = dscores @ self.K
-#         dK = dscores.transpose(0, 2, 1) @ self.Q
-
-#         # chain all back to input
-#         dx_q = dQ @ self.W_q.T
-#         dx_k = dK @ self.W_k.T
-#         dx_v = dV @ self.W_v.T
-
-#         dx = dx_q + dx_k + dx_v # total gradient to pass back
-#         if self.mask is not None:
-#             dx *= self.mask[:, :, None]
-
-#         # Compute gradients of weights
-#         self.dW_q = np.zeros_like(self.W_q)
-#         self.dW_k = np.zeros_like(self.W_k)
-#         self.dW_v = np.zeros_like(self.W_v)
-
-#         for b in range(B):
-#             self.dW_q += self.x[b].T @ dQ[b]  # (D, T) @ (T, D) = (D, D)
-#             self.dW_k += self.x[b].T @ dK[b]
-#             self.dW_v += self.x[b].T @ dV[b]
-
-#         return dx
-    
-#     def update(self, lr):
-#         # Calculate the L2 norm of the gradients
-#         # norm_dWq = np.linalg.norm(self.dW_q)
-#         # norm_dWk = np.linalg.norm(self.dW_k)
-#         # norm_dWv = np.linalg.norm(self.dW_v)
-
-#         # # We can also check the norm of the weights themselves
-#         # norm_Wq = np.linalg.norm(self.W_q)
-
-#         # print(f"Gradients Norms -> dW_q: {norm_dWq:.4f}, dW_k: {norm_dWk:.4f}, dW_v: {norm_dWv:.4f} | Weight Norm W_q: {norm_Wq:.4f}")
-
-#         self.W_q -= lr * self.dW_q
-#         self.W_k -= lr * self.dW_k
-#         self.W_v -= lr * self.dW_v
 
 class MultiHeadAttention:
     def __init__(self, embed_dim, num_heads):
@@ -309,8 +223,8 @@ class MultiHeadAttention:
         if self.mask is not None:
             # mask needs to be reshaped for broadcasting with heads
             # from (B, T) -> (B, 1, 1, T)
-            mask_expanded = mask[:, np.newaxis, np.newaxis, :]
-            scores = np.where(mask_expanded == 0, -1e9, scores)
+            # mask_expanded = self.mask[:, np.newaxis, np.newaxis, :]
+            scores = np.where(self.mask == 0, -1e9, scores)
 
         self.attn_weights = softmax(scores, axis=-1) # softmax over the last dimension
         # get the output from each head 
@@ -389,6 +303,80 @@ class MultiHeadAttention:
         self.W_k -= lr * self.dW_k
         self.W_v -= lr * self.dW_v
         self.W_o -= lr * self.dW_o
+
+class DecoderBlock:
+    def __init__(self, embed_dim, num_heads, ffn_dim):
+        # the first sub-layer: masked multi-head attention
+        self.norm1 = LayerNorm(embed_dim)
+        self.attention = MultiHeadAttention(embed_dim, num_heads)
+
+        # the second sub-layer: FFN
+        self.norm2 = LayerNorm(embed_dim)
+        self.ffn = FeedForward(embed_dim, ffn_dim)
+
+        # dropout layers
+        self.dropout1 = Dropout(p=0.1) # low dropout rate is common in transformers
+        self.dropout2 = Dropout(p=0.1)
+
+    def forward(self, x, padding_mask, look_ahead_mask):
+        # sub-layer 1: masked multi-head attention
+        # the input x is passed to the residual connection
+        self.attn_input = x
+        x_norm1 = self.norm1.forward(self.attn_input)
+        # the attention layer now receives both masks
+        attn_sublayer_output = self.attention.forward(x_norm1, padding_mask, look_ahead_mask)
+        # dropout
+        attn_sublayer_output = self.dropout1.forward(attn_sublayer_output)
+        # first residual connection
+        x_attended = self.attn_input + attn_sublayer_output
+
+        # sub-layer 2: FFN
+        # the output of the first sub-layer is the input to the second
+        self.ffn_input = x_attended
+        x_norm2 = self.norm2.forward(self.ffn_input)
+        ffn_sublayer_output = self.ffn.forward(x_norm2)
+        # dropout
+        ffn_sublayer_output = self.dropout2.forward(ffn_sublayer_output)
+        # second residual connection
+        final_output = self.ffn_input + ffn_sublayer_output
+
+        return final_output
+    
+    def backward(self, grad_output):
+        # backward through ffn sub-layer
+        grad_ffn_sublayer = grad_output
+        grad_ffn_skip = grad_output
+        grad_ffn_sublayer = self.dropout2.backward(grad_ffn_sublayer)
+        grad_from_ffn = self.ffn.backward(grad_ffn_sublayer)
+        grad_norm2 = self.norm2.backward(grad_from_ffn)
+        grad_from_ffn_block = grad_norm2 + grad_ffn_skip
+
+        # backward through attention sublayer
+        grad_attn_sublayer = grad_from_ffn_block
+        grad_attn_skip = grad_from_ffn_block
+        grad_attn_sublayer = self.dropout1.backward(grad_attn_sublayer)
+        grad_from_attn = self.attention.backward(grad_attn_sublayer)
+        grad_norm1 = self.norm1.backward(grad_from_attn)
+        final_grad = grad_norm1 + grad_attn_skip
+
+        return final_grad
+    
+    def update(self, learning_rate):
+        # update all learnable components in the block
+        self.attention.update(learning_rate)
+        self.ffn.update(learning_rate)
+        self.norm1.update(learning_rate)
+        self.norm2.update(learning_rate)
+        self.dropout1.update(learning_rate)
+        self.dropout2.update(learning_rate)
+
+    def train(self):
+        self.dropout1.is_training = True
+        self.dropout2.is_training = True
+    
+    def eval(self):
+        self.dropout1.is_training = False
+        self.dropout2.is_training = False
     
 class AttentionPooling:
     def __init__(self, embedding_dim):
@@ -737,6 +725,11 @@ def create_look_ahead_mask(seq_len):
     # where mask is 1, replace with large negative number, otherwise 0
     return np.where(mask == 1, -1e9, 0.0)
 
+def create_padding_mask(seq):
+    # seq is (B, T) tensor of token IDs
+    # returns a (B, 1, 1, T) mask that is 1 where seq is not 0, and 0 where it is
+    return (seq != 0)[:, np.newaxis, np.newaxis, :]
+
 def visualize_predictions(model, embed, pos_embed, pooling, tokenizer, texts, labels, id2label, max_len=20, num_samples=5):
     X_ids, mask = tokenizer.encode_batch(texts, max_len)
     x_embed = embed.forward(X_ids)
@@ -792,23 +785,23 @@ def custom_text_pred(model, embedding, pos_embed, norm1, attention, norm2, ffn, 
     print("Confidence      :", {id2label[i]: round(float(p), 4) for i, p in enumerate(probs[0])})
 
 # Main
-
 # load data
-dataset = load_dataset("ag_news")
-train_data = dataset["train"].select(range(10000))
-texts = [item["text"] for item in train_data]
-labels = [item["label"] for item in train_data]
+print("Loading custom dataset from facts_dataset.txt")
+with open("facts_dataset.txt", "r", encoding="utf-8") as f:
+    texts = f.read().splitlines()
+# dataset = load_dataset("ag_news")
+# train_data = dataset["train"].select(range(10000))
+# texts = [item["text"] for item in train_data]
 
 # checkpoint and tokenizer loading/fitting
-checkpoint_path = "model_checkpoint.npz"
-tokenizer_path = "tokenizer_files"
-current_num_samples = len(texts)
+tokenizer_path = "decoder_tokenizer_files"
+checkpoint_path = "decoder_checkpoint.npz"
 
-if os.path.exists(checkpoint_path) and os.path.exists(tokenizer_path):
+should_train = False
+
+if os.path.exists(tokenizer_path):
     print("Loading tokenizer from file...")
     tok = Tokenizer.load(tokenizer_path)
-    should_train = True # assume we might need to retrain, check model checkpoint next
-
 else:
     print("No tokenizer found. Fitting a new one.")
     tok = Tokenizer()
@@ -817,257 +810,212 @@ else:
     should_train = True # we must train if we made a new tokenizer
 
 # Encode + pad to a fixed length
-X_ids, mask = tok.encode_batch(texts, max_len = 20)
-labels = np.array(labels)
+# using a longer sequence length for generation
+X_ids, _ = tok.encode_batch(texts, max_len = 30)
+
+# create training inputs (x) and targets (y)
+# input is everything except the last token
+x_train = X_ids[:, :-1]
+# target is everything except the first token
+y_train = X_ids[:, 1:]
 
 # Build model pieces using existing classes
 vocab_size = len(tok.id2word)
-embedding_dim = 16
+embedding_dim = 64
 num_heads = 4 # 16 is divisible by 4
-ffn_dim = 128 # usually 2-4 times embed_dim
-hidden_dim = 64
-num_classes = 4
-max_len = X_ids.shape[1]
+ffn_dim = 256 # usually 2-4 times embed_dim
+num_layers = 2 # to stack 2 decoder blocks
+max_len = 200
 
-# Embedding + Pooling setup
+# Initialize all model components
 embedding = Embedding(vocab_size, embedding_dim, pad_id=tok.pad_id)
 pos_embed = PositionalEmbedding(max_len=max_len, embedding_dim=embedding_dim)
-attention = MultiHeadAttention(embedding_dim, num_heads)
-ffn = FeedForward(embedding_dim, ffn_dim)
-norm1 = LayerNorm(embedding_dim)
-norm2 = LayerNorm(embedding_dim)
-# pooling = MaskedMeanPooling()
-dropout = Dropout(p=0.5)
-pooling = AttentionPooling(embedding_dim)
+decoder_blocks = [DecoderBlock(embedding_dim, num_heads, ffn_dim) for _ in range(num_layers)]
+final_layer = Linear(embedding_dim, vocab_size) # predicts a score for every word in the vocab
 
-# Neural Network layer config
-layer_config = [
-    (embedding_dim, hidden_dim, 'relu'),
-    (hidden_dim, num_classes, 'none')
-]
-
-model = NeuralNetwork(layer_config)
-
-X_ids_orig = X_ids.copy()
-mask_orig = mask.copy()
-labels_orig = labels.copy()
-
-# Training Configuration
-perm = np.random.permutation(len(X_ids))
-X_ids = X_ids[perm]; y = labels[perm]
-
-epochs = 100
-learning_rate = 0.0002
-batch_size = 2
-checkpoint_path = "model_checkpoint.npz"
-current_num_samples = len(X_ids)
+checkpoint_path = "decoder_checkpoint.npz"
 should_train = True
-best_acc = 0.0 # Initiate best accuracy
 
-# check if model exists and matches current dataset
-if os.path.exists("model_checkpoint.npz"):
-    data = np.load("model_checkpoint.npz")
-    # check if number of samples match
-    if "num_samples" in data and data["num_samples"] == current_num_samples:
-        # embeddings
-        embedding.embedding = data["embed_weights"]
-        pos_embed.embedding = data["pos_weights"]
-        # attention
-        attention.W_q = data["attn_Wq"]
-        attention.W_k = data["attn_Wk"]
-        attention.W_v = data["attn_Wv"]
-        attention.W_o = data["attn_Wo"]
-        # norm layers
-        norm1.gamma = data["norm1_gamma"]
-        norm1.beta = data["norm1_beta"]
-        norm2.gamma = data["norm2_gamma"]
-        norm2.beta = data["norm2_beta"]
-        # ffn
-        ffn.layer1.W = data["ffn_W1"]
-        ffn.layer1.b = data["ffn_b1"]
-        ffn.layer2.W = data["ffn_W2"]
-        ffn.layer2.b = data["ffn_b2"]
-        # pooling
-        pooling.query = data["pool_query"]
-        # final classifier
-        for i, (layer, _) in enumerate(model.layers):
-            layer.W = data[f"W{i}"]
-            layer.b = data[f"b{i}"]
-        print("Checkpoint loaded. Skipped training.")
+if os.path.exists(checkpoint_path):
+    print("Loading model weights from checkpoint...")
+    data = np.load(checkpoint_path)
+    try:
+        embedding.embedding = data["embedding"]
+        pos_embed.embedding = data["pos_embed"]
+        for i, block in enumerate(decoder_blocks):
+            block.attention.W_q = data[f'block_{i}_attn_Wq']
+            block.attention.W_k = data[f'block_{i}_attn_Wk']
+            block.attention.W_v = data[f'block_{i}_attn_Wv']
+            block.attention.W_o = data[f'block_{i}_attn_Wo']
+            block.norm1.gamma = data[f'block_{i}_norm1_gamma']
+            block.norm1.beta = data[f'block_{i}_norm1_beta']
+            block.norm2.gamma = data[f'block_{i}_norm2_gamma']
+            block.norm2.beta = data[f'block_{i}_norm2_beta']
+            block.ffn.layer1.W = data[f'block_{i}_ffn_W1']
+            block.ffn.layer1.b = data[f'block_{i}_ffn_b1']
+            block.ffn.layer2.W = data[f'block_{i}_ffn_W2']
+            block.ffn.layer2.b = data[f'block_{i}_ffn_b2']
+        final_layer.W = data['final_layer_W']
+        final_layer.b = data['final_layer_b']
         should_train = False
-    else:
-        print("Checkpoint invalid (dataset changed). Retraining...")
+        print("Checkpoint loaded successfully. Training skipped.")
+    except KeyError:
+        print("Checkpoint is invalid. Retraining...")
         should_train = True
 else:
-    print("No checkpoint found. Training model from scratch.")
-    should_train = True
+    print("No model checkpoint found. Training from scratch")
 
+# Training Loop
 if should_train:
-    dropout.is_training = True # ensure dropout is ON for training
+    epochs = 100 # generation is harder, so more epochs might be needed
+    learning_rate = 0.0002
+    batch_size = 4 # can use a larger batch size
+
+    # set model to training mode
+    for block in decoder_blocks:
+        block.train()
+
+    # shuffle data
+    indices = np.random.permutation(len(x_train))
+    x_train = x_train[indices]
+    y_train = y_train[indices]
+
     for epoch in range(epochs):
-        # shuffle every epoch
-        indices = np.random.permutation(len(X_ids))
-        X_ids = X_ids[indices]
-        mask = mask[indices]
-        y = y[indices]
-
         # mini-batches
-        for i in range(0, len(X_ids), batch_size):
-            xb = X_ids[i:i+batch_size]           # (B, T)
-            mb = mask[i:i+batch_size]
-            yb = y[i:i+batch_size]               # (B,)
+        for i in range(0, len(x_train), batch_size):
+            xb = x_train[i:i+batch_size]           # (B, T)
+            yb = y_train[i:i+batch_size]               # (B,)
             
+            # create masks for the decoder
+            padding_mask = create_padding_mask(xb)
+            look_ahead_mask = create_look_ahead_mask(xb.shape[1])
+
             # Forward Pass
-            x_embed = embedding.forward(xb)      # (B, T, D)
-            x_embed = pos_embed.forward(x_embed) # (B, T, D)
+            x = embedding.forward(xb)      # (B, T, D)
+            x = pos_embed.forward(x) # (B, T, D)
+            for block in decoder_blocks:
+                x = block.forward(x, padding_mask, look_ahead_mask)
+            logits = final_layer.forward(x)
 
-            # residual connection start
-            # sub layer 1: self attention
-            x_norm1 = norm1.forward(x_embed)
-            x_attended_sublayer = attention.forward(x_norm1, mb)
-            x_attended = x_embed + x_attended_sublayer # first residual connection
-            # sub layer 2: feed-forward network
-            x_norm2 = norm2.forward(x_attended)
-            x_ffn_sublayer = ffn.forward(x_norm2)
-            x_ffn = x_attended + x_ffn_sublayer # second residual connection
-            # residual connection end
-
-            x_pooled = pooling.forward(x_ffn, mb) # (B, D)
-            x_dropped_out = dropout.forward(x_pooled)
-            logits = model.forward(x_dropped_out)     # (B, C)
-            # logits -= np.max(logits, axis = 1, keepdims=True)
-            probs = softmax(logits)              # (B, C)
-            loss = cross_entropy_batch(probs, yb)
-
+            # calculate loss
+            B, T, V = logits.shape
+            logits_reshaped = logits.reshape(B * T, V)
+            yb_reshaped = yb.reshape(B * T)
+            probs = softmax(logits_reshaped)
+            loss = cross_entropy_batch(probs, yb_reshaped)
+        
             # Backward Pass
-            grad = gradient_loss(probs, yb)                # (B, C)
-            grad_in = model.backward(grad)                 # (B, D)
-            grad_dropout = dropout.backward(grad_in)
-            grad_pool = pooling.backward(grad_dropout)          # (B, T, D)
+            grad = gradient_loss(probs, yb_reshaped)                # (B, C)
+            grad = grad.reshape(B, T, V)
 
-            # backward through ffn sublayer
-            grad_ffn_sublayer = grad_pool
-            grad_ffn_skip = grad_pool
-            grad_from_ffn = ffn.backward(grad_ffn_sublayer)
-            grad_norm2 = norm2.backward(grad_from_ffn)
-            grad_from_ffn_block = grad_norm2 + grad_ffn_skip
+            grad = final_layer.backward(grad)
+            for block in reversed(decoder_blocks):
+                grad = block.backward(grad)
+            grad = pos_embed.backward(grad)
+            embedding.backward(grad)
 
-            # backward through attention sublayer
-            grad_attn_sublayer = grad_from_ffn_block
-            grad_attn_skip = grad_from_ffn_block
-            grad_attn = attention.backward(grad_attn_sublayer)
-            grad_norm1 = norm1.backward(grad_attn)
-            grad_total = grad_norm1 + grad_attn_skip
-
-            grad_embed = pos_embed.backward(grad_total)
-            embedding.backward(grad_embed)        # updates d_embedding
-
-            ffn.update(learning_rate)
-            norm1.update(learning_rate)
-            norm2.update(learning_rate)
+            # Update step
+            final_layer.update(learning_rate)
+            for block in decoder_blocks:
+                block.update(learning_rate)
             pos_embed.update(learning_rate)
-            attention.update(learning_rate)
-            model.update(learning_rate)
             embedding.update(learning_rate)
-            pooling.update(learning_rate)
 
-        if epoch % 10 == 0:
-            dropout.is_training = False
-            # start of mini-batch training
-            all_preds = []
-            eval_batch_size = 64 # a reasonable batch size for evaluation
+        print(f"Epoch {epoch:2d}: Loss={loss:4f}")
+    
+    # save the final training model
+    print("Training complete. Saving final model...")
+    save_dict = {
+        'embedding': embedding.embedding,
+        'pos_embed': pos_embed.embedding,
+        'final_layer_W': final_layer.W,
+        'final_layer_b': final_layer.b,
+    }
+    for i, block in enumerate(decoder_blocks):
+        save_dict[f'block_{i}_attn_Wq'] = block.attention.W_q
+        save_dict[f'block_{i}_attn_Wk'] = block.attention.W_k
+        save_dict[f'block_{i}_attn_Wv'] = block.attention.W_v
+        save_dict[f'block_{i}_attn_Wo'] = block.attention.W_o
+        save_dict[f'block_{i}_norm1_gamma'] = block.norm1.gamma
+        save_dict[f'block_{i}_norm1_beta'] = block.norm1.beta
+        save_dict[f'block_{i}_norm2_gamma'] = block.norm2.gamma
+        save_dict[f'block_{i}_norm2_beta'] = block.norm2.beta
+        save_dict[f'block_{i}_ffn_W1'] = block.ffn.layer1.W
+        save_dict[f'block_{i}_ffn_b1'] = block.ffn.layer1.b
+        save_dict[f'block_{i}_ffn_W2'] = block.ffn.layer2.W
+        save_dict[f'block_{i}_ffn_b2'] = block.ffn.layer2.b
+    np.savez(checkpoint_path, **save_dict)
 
-            for i in range(0, len(X_ids_orig), eval_batch_size):
-                # get mini batch of the original, unshuffled data
-                xb_eval = X_ids_orig[i:i+eval_batch_size]
-                mb_eval = mask_orig[i:i+eval_batch_size]
+# Text Generation (Inference)
+def generate(prompt, max_tokens = 30, temperature = 0.8, top_k = 50):
+    # set model to evaluation mode
+    for block in decoder_blocks:
+        block.eval()
 
-                # forward pass for the entire validation set
-                x_eval_embed = embedding.forward(xb_eval)
-                x_eval_embed = pos_embed.forward(x_eval_embed)
-                
-                # sublayer1: self attention
-                x_eval_norm1 = norm1.forward(x_eval_embed)
-                x_eval_attended_sublayer = attention.forward(x_eval_norm1, mb_eval)
-                x_eval_attended = x_eval_embed + x_eval_attended_sublayer
+    tokens = [tok.start_id] + [tok.word2id.get(w, tok.unk_id) for w in tok.tokenize(prompt)]
 
-                # sublayer2: feed-forward network
-                x_eval_norm2 = norm2.forward(x_eval_attended)
-                x_eval_ffn_sublayer = ffn.forward(x_eval_norm2)
-                x_eval_ffn = x_eval_attended + x_eval_ffn_sublayer
+    for _ in range(max_tokens):
+        x_gen = np.array([tokens])
 
-                # final pooling and classification
-                x_eval_pooled = pooling.forward(x_eval_ffn, mb_eval)
-                x_eval_dropout = dropout.forward(x_eval_pooled)
-                preds_logits = model.forward(x_eval_dropout)
+        look_ahead_mask = create_look_ahead_mask(x_gen.shape[1])
+        padding_mask = create_padding_mask(x_gen)
 
-                # get predictions for this batch and store them
-                batch_preds = np.argmax(preds_logits, axis=1)
-                all_preds.extend(batch_preds.tolist())
+        # Forward pass
+        x = embedding.forward(x_gen)
+        x = pos_embed.forward(x)
+        for block in decoder_blocks:
+            x = block.forward(x, padding_mask, look_ahead_mask)
+        logits = final_layer.forward(x)
 
-            # probs = softmax(preds_logits)
-            # preds = np.argmax(probs, axis = 1)
-            acc = accuracy(np.array(all_preds), labels_orig)
-            # end of mini batch evaluation
+        last_word_logits = logits[0, -1, :]
+        #higher temp makes it more random, lower temp makes it more confident
+        if temperature > 0:
+            last_word_logits = last_word_logits / temperature
 
-            # mean_conf = np.mean(probs[np.arange(len(labels_orig)), labels_orig])
-            print(f"Epoch {epoch:3d}: Loss={loss:.4f}, Accuracy={acc:.2f}")
+        probs = softmax(last_word_logits)
+        next_token_id = np.random.choice(len(probs), p = probs)
+        # next_token_id = np.argmax(probs)
 
-            if acc > best_acc:
-                best_acc = acc
-                print("Saving new model...")
-                save_dict = {
-                    # embeddings
-                    "embed_weights" : embedding.embedding,
-                    "pos_weights" : pos_embed.embedding,
-                    # attention
-                    "attn_Wq" : attention.W_q,
-                    "attn_Wk" : attention.W_k,
-                    "attn_Wv" : attention.W_v,
-                    "attn_Wo" : attention.W_o,
-                    # norm layers
-                    "norm1_gamma" : norm1.gamma,
-                    "norm1_beta" : norm1.beta,
-                    "norm2_gamma" : norm2.gamma,
-                    "norm2_beta" : norm2.beta,
-                    # ffn
-                    "ffn_W1" : ffn.layer1.W,
-                    "ffn_b1" : ffn.layer1.b,
-                    "ffn_W2" : ffn.layer2.W,
-                    "ffn_b2" : ffn.layer2.b,
-                    # pooling
-                    "pool_query" : pooling.query,
-                    # other info
-                    "num_samples" : current_num_samples,
-                }
+        if next_token_id == tok.end_id:
+            break
 
-                # add final classifier weights
-                for i, (layer, _) in enumerate(model.layers):
-                    save_dict[f"W{i}"] = layer.W
-                    save_dict[f"b{i}"] = layer.b
+        tokens.append(int(next_token_id))
 
-                np.savez("model_checkpoint.npz", **save_dict)
-                tok.save(tokenizer_path)
-            dropout.is_training = True # try it back ON for the next training epoch
-
+    generated_text = " ".join([tok.id2word[i] for i in tokens])
+    return generated_text
 
 # Visualize training with some sentences
-id2label = {0: "World", 1: "Sports", 2: "Business", 3: "Sci/Tech",}
+prompt1 = "darwin"
+generated_text1 = generate(prompt1)
+print("-"*50)
+print(f"Prompt: '{prompt1}'")
+print(f"Generated text: {generated_text1}")
 
-test_texts = dataset["test"]["text"][:20]
-test_labels = dataset["test"]["label"][:20]
+prompt2 = "euclid"
+generated_text2 = generate(prompt2)
+print("-"*50)
+print(f"Prompt: '{prompt2}'")
+print(f"Generated text: {generated_text2}")
+                
 
-# visualize_predictions(model, embedding, pos_embed, pooling, tok, test_texts, test_labels, id2label)
+           
+# # Visualize training with some sentences
+# id2label = {0: "World", 1: "Sports", 2: "Business", 3: "Sci/Tech",}
 
-custom_text = "rocket jupiter nasa nasa rocket moon interest usa interest income"
-dropout.is_training = False
-custom_text_pred(model, embedding, pos_embed, norm1, attention, norm2, ffn, pooling, dropout, tok, custom_text, id2label)
+# test_texts = dataset["test"]["text"][:20]
+# test_labels = dataset["test"]["label"][:20]
 
-np.savez("final_model_checkpoint.npz",
-    embed_weights = embedding.embedding,
-    pos_weights = pos_embed.embedding,
-    num_samples = current_num_samples,
-    **{f"W{i}": layer.W for i, (layer, _) in enumerate(model.layers)},
-    **{f"b{i}": layer.b for i, (layer, _) in enumerate(model.layers)})
+# # visualize_predictions(model, embedding, pos_embed, pooling, tok, test_texts, test_labels, id2label)
+
+# custom_text = "rocket jupiter nasa nasa rocket moon interest usa interest income"
+# dropout.is_training = False
+# custom_text_pred(model, embedding, pos_embed, norm1, attention, norm2, ffn, pooling, dropout, tok, custom_text, id2label)
+
+# np.savez("final_model_checkpoint.npz",
+#     embed_weights = embedding.embedding,
+#     pos_weights = pos_embed.embedding,
+#     num_samples = current_num_samples,
+#     **{f"W{i}": layer.W for i, (layer, _) in enumerate(model.layers)},
+#     **{f"b{i}": layer.b for i, (layer, _) in enumerate(model.layers)})
     
-print("Final model saved.")
+# print("Final model saved.")
