@@ -1,7 +1,14 @@
-own.py
+Neuron.py
 
-ahem.py
+# bigram_numpy.py
+# bigram_pytorch.py
 
 *.npz
 
 decoder_tokenizer_files/
+
+tokenizer_files/
+
+tinyshakespeare.txt
+
+names.txt

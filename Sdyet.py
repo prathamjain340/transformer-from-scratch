@@ -4,9 +4,10 @@ from collections import Counter
 from datasets import load_dataset
 import os
 import json
+import requests
 
 class Tokenizer:
-    def __init__(self, vocab_size=5000, unk_token="<UNK>", pad_token="<PAD>", start_token="<START>", end_token="<END>"):
+    def __init__(self, vocab_size=8000, unk_token="<UNK>", pad_token="<PAD>", start_token="<START>", end_token="<END>"):
         self.vocab_size = vocab_size
         self.unk_token = unk_token
         self.pad_token = pad_token
@@ -784,11 +785,21 @@ def custom_text_pred(model, embedding, pos_embed, norm1, attention, norm2, ffn, 
     print(f"Predicted Label : {pred_label}")
     print("Confidence      :", {id2label[i]: round(float(p), 4) for i, p in enumerate(probs[0])})
 
+def download_shakespeare():
+    url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+    response = requests.get(url)
+    with open("tinyshakespeare.txt", "w", encoding="utf-8") as f:
+        f.write(response.text)
+    print("Download tinyshakespeare.txt")
+
 # Main
 # load data
-print("Loading custom dataset from facts_dataset.txt")
-with open("facts_dataset.txt", "r", encoding="utf-8") as f:
-    texts = f.read().splitlines()
+download_shakespeare()
+print("Loading custom dataset from tinyshakespeare.txt")
+with open("tinyshakespeare.txt", "r", encoding="utf-8") as f:
+    texts = f.read().splitlines('\n\n')
+
+texts = texts[:2000]
 # dataset = load_dataset("ag_news")
 # train_data = dataset["train"].select(range(10000))
 # texts = [item["text"] for item in train_data]
@@ -811,7 +822,7 @@ else:
 
 # Encode + pad to a fixed length
 # using a longer sequence length for generation
-X_ids, _ = tok.encode_batch(texts, max_len = 30)
+X_ids, _ = tok.encode_batch(texts, max_len = 60)
 
 # create training inputs (x) and targets (y)
 # input is everything except the last token
@@ -821,9 +832,9 @@ y_train = X_ids[:, 1:]
 
 # Build model pieces using existing classes
 vocab_size = len(tok.id2word)
-embedding_dim = 64
+embedding_dim = 256
 num_heads = 4 # 16 is divisible by 4
-ffn_dim = 256 # usually 2-4 times embed_dim
+ffn_dim = 1024 # usually 2-4 times embed_dim
 num_layers = 2 # to stack 2 decoder blocks
 max_len = 200
 
@@ -869,7 +880,7 @@ else:
 if should_train:
     epochs = 100 # generation is harder, so more epochs might be needed
     learning_rate = 0.0002
-    batch_size = 4 # can use a larger batch size
+    batch_size = 32 # can use a larger batch size
 
     # set model to training mode
     for block in decoder_blocks:
@@ -947,7 +958,7 @@ if should_train:
     np.savez(checkpoint_path, **save_dict)
 
 # Text Generation (Inference)
-def generate(prompt, max_tokens = 30, temperature = 0.8, top_k = 50):
+def generate(prompt, max_tokens = 30, temperature = 1.8, top_p = 0.95):
     # set model to evaluation mode
     for block in decoder_blocks:
         block.eval()
@@ -973,7 +984,22 @@ def generate(prompt, max_tokens = 30, temperature = 0.8, top_k = 50):
             last_word_logits = last_word_logits / temperature
 
         probs = softmax(last_word_logits)
-        next_token_id = np.random.choice(len(probs), p = probs)
+        # top-p (nucleus)
+        sorted_indices = np.argsort(probs)[::-1]
+        sorted_probs = probs[sorted_indices]
+
+        # find the cutoff point
+        cumulative_probs = np.cumsum(sorted_probs)
+        cutoff_index = np.where(cumulative_probs > top_p)[0][0]
+
+        # keep only the top probabilities that meet the threshold
+        top_p_indices = sorted_indices[:cutoff_index + 1]
+        top_p_probs = probs[top_p_indices]
+
+        # re-normalize to make sure they sum to 1
+        top_p_probs = top_p_probs / np.sum(top_p_probs)
+
+        next_token_id = np.random.choice(top_p_indices, p = top_p_probs)
         # next_token_id = np.argmax(probs)
 
         if next_token_id == tok.end_id:
@@ -985,13 +1011,13 @@ def generate(prompt, max_tokens = 30, temperature = 0.8, top_k = 50):
     return generated_text
 
 # Visualize training with some sentences
-prompt1 = "darwin"
+prompt1 = "Love is a"
 generated_text1 = generate(prompt1)
 print("-"*50)
 print(f"Prompt: '{prompt1}'")
 print(f"Generated text: {generated_text1}")
 
-prompt2 = "euclid"
+prompt2 = "Hate is"
 generated_text2 = generate(prompt2)
 print("-"*50)
 print(f"Prompt: '{prompt2}'")
