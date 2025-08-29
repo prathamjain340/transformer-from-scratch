@@ -65,14 +65,22 @@ for w in words[:1]:
 
 xs = torch.tensor(xs)
 ys = torch.tensor(ys)
-# print(xs, ys)
 
-xenc = F.one_hot(xs, num_classes=27).float()
-W = torch.randn((27, 27))
-logits = xenc @ W
-counts = logits.exp()
-probs = counts / counts.sum(1, keepdims=True)
-print(probs)
+# randomly initialize 27 neurons;' weights, ,each neuron receives 27 inputs
+g = torch.Generator().manual_seed(2147483647)
+W = torch.randn((27, 27), generator=g, requires_grad=True)
 
-# so for the example of (.e em mm ma a.), probs[0] shows probability of letters after "."
-# we feed in "." into the neural net, for this we first got its index, then one-hot endcoded it, then it went into the neural net, where it was multiplied by weights, got exponentiated, then normalised, these all are differentiable so that we can backpropagate through it later
+for i in range(10):
+    # Forward pass
+    xenc = F.one_hot(xs, num_classes=27).float() # input to the network: one-hot encoding
+    logits = xenc @ W # predict log-counts
+    # softmax
+    counts = logits.exp()# counts, equivalent to N
+    probs = counts / counts.sum(1, keepdims=True) # probabilities for the next character
+    loss = -probs[torch.arange(5), ys].log().mean()
+    # Backward pass
+    W.grad = None # set gradient to zero
+    loss.backward()
+    # Update
+    W.data += -0.1 * W.grad
+    print(loss.item())
