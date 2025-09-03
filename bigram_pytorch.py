@@ -1,77 +1,73 @@
-# c:43.5 d:128
 import torch
 import torch.nn.functional as F
+
+# read in all words
 words = open("names.txt", "r").read().splitlines()
 
-# N = torch.zeros((27, 27))
+# build vocabulary of characters and mappings to/from integers
 char = sorted(set(''.join(words)))
 stoi = {s:i+1 for i, s in enumerate(char)}
 stoi["."] = 0
-
 itos = {i:s for s, i  in stoi.items()}
 
-# before: to make count matrix
-# for w in words:
-#     chs = "." + w + "."
-#     for ch1, ch2 in zip(chs, chs[1:]):
-#         ix1 = stoi[ch1]
-#         ix2 = stoi[ch2]
-#         N[ix1, ix2] += 1
-
-# BIGRAM WITH NEAURAL NETWORK
-
-# create the training set of bigram (x,y)
-
-# now: to make count matrix
-xs, ys = [], []
+# build the dataset
+block_size = 3 # context length: how many characters do we take to predict the next one
+X, Y = [], []
 for w in words:
-    chs = ["."] + list(w) + ["."]
-    for ch1, ch2 in zip(chs, chs[1:]):
-        ix1 = stoi[ch1]
-        ix2 = stoi[ch2]
-        xs.append(ix1)
-        ys.append(ix2)
-xs = torch.tensor(xs)
-ys = torch.tensor(ys)
-num = xs.nelement()
+    # print(w)
+    context = [0] * block_size
+    for ch in w + '.':
+        ix = stoi[ch]
+        X.append(context)
+        Y.append(ix)
+        # print(''.join(itos[i] for i in context), '----->', itos[ix])
+        context = context[1:] + [ix]
 
-# randomly initialize 27 neurons;' weights, ,each neuron receives 27 inputs
-g = torch.Generator().manual_seed(2147483647)
-W = torch.randn((27, 27), generator=g, requires_grad=True)
+X = torch.tensor(X)
+Y = torch.tensor(Y)
 
-# epochs over the NN
-# for i in range(100):
-#     # Forward pass
-#     xenc = F.one_hot(xs, num_classes=27).float() # input to the network: one-hot encoding
-#     logits = xenc @ W # predict log-counts
-#     # softmax
-#     counts = logits.exp()# counts, equivalent to N
-#     probs = counts / counts.sum(1, keepdims=True) # probabilities for the next character
-#     loss = -probs[torch.arange(num), ys].log().mean()
+C = torch.randn((27, 2))
+W1 = torch.randn(6, 100)
+b1 = torch.randn(100)
+W2 = torch.randn(100, 27)
+b2 = torch.randn(27)
+parameters = [C, W1, b1, W2, b2]
 
-#     # Backward pass
-#     W.grad = None # set gradient to zero
-#     loss.backward()
-    
-#     # Update
-#     W.data += -50 * W.grad
-#     print(loss.item())
+for p in parameters:
+    p.requires_grad = True
 
-for i in range(5):
-    out = []
-    ix = 0
-    while True:
-        # before
-        # p = P[ix]
+# lre = torch.linspace(-3, 0, 1000)
+# lrs = 10**lre
 
-        #now
-        xenc = F.one_hot(torch.tensor([ix]), num_classes=27).float()
-        logits = xenc @ W
-        counts = logits.exp()
-        probs = counts / counts.sum(1, keepdims=True)
+# lri = []
+# lossi = []
 
-        ix = torch.multinomial(probs, num_samples=1, replacement=True, generator=g).item()
-        out.append(itos[ix])
-        if ix == 0:
-            break
-    print("".join(out))
+for i in range(10000):
+    # mini batch construct
+    ix = torch.randint(0, X.shape[0], (32,))
+
+    # forward pass
+    emb = C[X[ix]] # (32, 3, 2)
+    h = torch.tanh(emb.view(-1, 6) @ W1 + b1) # (32, 100)
+    logits = h @ W2 + b2 # (32, 27)
+    # counts = logits.exp()
+    # probs = counts / counts.sum(1, keepdims=True)
+    # loss = -probs[torch.arange(32), Y].log().mean()
+    loss = F.cross_entropy(logits, Y[ix])
+
+    # backward pass
+    for p in parameters:
+        p.grad = None
+    loss.backward()
+
+    # update
+    # lr = lrs[i]
+    lr = 0.01
+    for p in parameters:
+        p.data += -lr * p.grad
+
+    # track stats
+    # lri.append(lre[i])
+    # lossi.append(loss.item())
+
+print(f'loss: {loss.item()}')
