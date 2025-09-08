@@ -43,10 +43,10 @@ n_embd = 10 # the dimensionality of the character embedding vectors
 n_hidden = 200 # the number of neurons in the hidden layer of the MLP
 
 C = torch.randn((vocab_size, n_embd))
-W1 = torch.randn(n_embd * block_size, n_hidden)
-b1 = torch.randn(n_hidden)
-W2 = torch.randn(n_hidden, vocab_size)
-b2 = torch.randn(vocab_size)
+W1 = torch.randn(n_embd * block_size, n_hidden) * 0.2
+b1 = torch.randn(n_hidden) * 0.01
+W2 = torch.randn(n_hidden, vocab_size) * 0.01
+b2 = torch.randn(vocab_size) * 0
 
 parameters = [C, W1, b1, W2, b2]
 parasum = sum(p.nelement() for p in parameters) # total number of parameters

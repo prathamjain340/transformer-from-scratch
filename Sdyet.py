@@ -933,30 +933,30 @@ if should_train:
             embedding.update(learning_rate)
 
         print(f"Epoch {epoch:2d}: Loss={loss:4f}")
+        if (epoch + 1) % 10 == 0:
+            print(f"--- Saving checkpoint at epoch {epoch} ---")
+            save_dict = {
+                'embedding': embedding.embedding,
+                'pos_embed': pos_embed.embedding,
+                'final_layer_W': final_layer.W,
+                'final_layer_b': final_layer.b,
+            }
+            for i, block in enumerate(decoder_blocks):
+                save_dict[f'block_{i}_attn_Wq'] = block.attention.W_q
+                save_dict[f'block_{i}_attn_Wk'] = block.attention.W_k
+                save_dict[f'block_{i}_attn_Wv'] = block.attention.W_v
+                save_dict[f'block_{i}_attn_Wo'] = block.attention.W_o
+                save_dict[f'block_{i}_norm1_gamma'] = block.norm1.gamma
+                save_dict[f'block_{i}_norm1_beta'] = block.norm1.beta
+                save_dict[f'block_{i}_norm2_gamma'] = block.norm2.gamma
+                save_dict[f'block_{i}_norm2_beta'] = block.norm2.beta
+                save_dict[f'block_{i}_ffn_W1'] = block.ffn.layer1.W
+                save_dict[f'block_{i}_ffn_b1'] = block.ffn.layer1.b
+                save_dict[f'block_{i}_ffn_W2'] = block.ffn.layer2.W
+                save_dict[f'block_{i}_ffn_b2'] = block.ffn.layer2.b
+            np.savez(checkpoint_path, **save_dict)
+            tok.save(tokenizer_path)
     
-    # save the final training model
-    print("Training complete. Saving final model...")
-    save_dict = {
-        'embedding': embedding.embedding,
-        'pos_embed': pos_embed.embedding,
-        'final_layer_W': final_layer.W,
-        'final_layer_b': final_layer.b,
-    }
-    for i, block in enumerate(decoder_blocks):
-        save_dict[f'block_{i}_attn_Wq'] = block.attention.W_q
-        save_dict[f'block_{i}_attn_Wk'] = block.attention.W_k
-        save_dict[f'block_{i}_attn_Wv'] = block.attention.W_v
-        save_dict[f'block_{i}_attn_Wo'] = block.attention.W_o
-        save_dict[f'block_{i}_norm1_gamma'] = block.norm1.gamma
-        save_dict[f'block_{i}_norm1_beta'] = block.norm1.beta
-        save_dict[f'block_{i}_norm2_gamma'] = block.norm2.gamma
-        save_dict[f'block_{i}_norm2_beta'] = block.norm2.beta
-        save_dict[f'block_{i}_ffn_W1'] = block.ffn.layer1.W
-        save_dict[f'block_{i}_ffn_b1'] = block.ffn.layer1.b
-        save_dict[f'block_{i}_ffn_W2'] = block.ffn.layer2.W
-        save_dict[f'block_{i}_ffn_b2'] = block.ffn.layer2.b
-    np.savez(checkpoint_path, **save_dict)
-
 # Text Generation (Inference)
 def generate(prompt, max_tokens = 30, temperature = 1.8, top_p = 0.95):
     # set model to evaluation mode
