@@ -3,10 +3,7 @@ import tiktoken
 from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 from transformers import GPT2LMHeadModel
-
-# read the raw text
-with open("tinyshakespeare.txt", "r", encoding="utf8") as f:
-    raw_text = f.read()
+from transformers import GPT2TokenizerFast
 
 class GPTdataset(Dataset):
     def __init__(self, txt, tokenizer, max_length, stride):
@@ -46,97 +43,52 @@ def create_dataloader(txt, batch_size = 4, max_length = 256, stride = 128, shuff
     )
     return dataloader
 
-def calculate_loss(model, dataloader, device):
-    model.eval() # set model to evaluation mode
-    total_loss = 0
-    with torch.no_grad():
-        for inputs, targets in dataloader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            logits = model(inputs)
-            loss = nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1)
-            )
-            total_loss += loss.item()
-    return total_loss / len(dataloader)
 
-
-# model configuration
-# these values are for a GPT-2 small (124M) model
-model_config = {
-    "vocab_size": 50257,    # vocabulary size
-    "context_length": 1024, # context length (smaller right now fro training)
-    "emb_dim": 768,         # embedding dimension
-    "n_heads": 12,          # number of attention heads
-    "n_layers": 12,         # number of layers
-    "drop_rate": 0.1,       # dropout rate
-    "qkv_bias": False,      # query-key-value bias
-}
     
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_in, d_out, context_length, num_heads, dropout = 0.1, qkv_bias = False):
+    def __init__(self, d_in, d_out, context_length, num_heads, dropout=0.1):
         super().__init__()
-        # ensure the output dimension is divisible by the number of heads
-        assert d_out % num_heads == 0, "d_out must be divisible num_heads"
+        assert d_out % num_heads == 0, "d_out must be divisible by num_heads"
 
         self.d_out = d_out
         self.num_heads = num_heads
-        self.head_dim = d_out // num_heads # the dimension for each head's Q, K, V
+        self.head_dim = d_out // num_heads
 
-        self.W_query = nn.Linear(d_in, d_out, bias=qkv_bias)
-        self.W_key = nn.Linear(d_in, d_out, bias=qkv_bias)
-        self.W_value = nn.Linear(d_in, d_out, bias=qkv_bias)
-        self.out_proj = nn.Linear(d_in, d_out) # final linear layer
+        # Enable biases to match GPT-2
+        self.W_query = nn.Linear(d_in, d_out, bias=True)
+        self.W_key   = nn.Linear(d_in, d_out, bias=True)
+        self.W_value = nn.Linear(d_in, d_out, bias=True)
+        self.out_proj = nn.Linear(d_out, d_out, bias=True)
         self.dropout = nn.Dropout(dropout)
 
         self.register_buffer('mask', torch.triu(torch.ones(context_length, context_length), diagonal=1))
 
     def forward(self, x):
-        b, sequence_length, d_in = x.shape
+        b, seq_len, _ = x.shape
 
-        # create Q, K, V vectors
-        queries = self.W_query(x)
-        keys = self.W_key(x)
-        values = self.W_value(x)
+        # Q, K, V
+        q = self.W_query(x).view(b, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.W_key(x).view(b, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.W_value(x).view(b, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # reshape and transpose for multi-head processing
-        # original shape:(batch, seq_len, emb_dim)
-        # new shape: (batch, num_heads, seq_len, head_dim)
-        queries = queries.view(b, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
-        keys = keys.view(b, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
-        values = values.view(b, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
+        # Attention scores
+        attn_scores = q @ k.transpose(-2, -1) / (self.head_dim ** 0.5)
+        attn_scores.masked_fill_(self.mask[:seq_len, :seq_len].bool(), float('-inf'))
 
-        # compute attention scores
-        attn_scores = queries @ keys.transpose(2, 3) # transpose last two dimensions
+        attn_probs = torch.softmax(attn_scores, dim=-1)
+        attn_probs = self.dropout(attn_probs)
 
-        # apply causal mask
-        attn_scores.masked_fill_(self.mask.bool()[:sequence_length, :sequence_length], -torch.inf)
+        # Weighted sum
+        context = (attn_probs @ v).transpose(1, 2).contiguous().view(b, seq_len, self.d_out)
+        return self.out_proj(context)
 
-        # compute attention weights and apply dropout
-        attn_weights = torch.softmax(attn_scores / self.head_dim**0.5, dim = -1)
-        attn_weights = self.dropout(attn_weights)
-
-        # compute context vectors
-        context_vec = (attn_weights @ values).transpose(1, 2)
-
-        # combine heads back into a single tensor
-        context_vec = context_vec.contiguous().view(b, sequence_length, self.d_out)
-
-        # pass through the final linear layer
-        return self.out_proj(context_vec)
-    
 class LayerNorm(nn.Module):
     def __init__(self, emb_dim):
         super().__init__()
-        self.eps = 1e-5
-        self.scale = nn.Parameter(torch.ones(emb_dim))
-        self.shift = nn.Parameter(torch.zeros(emb_dim))
+        self.norm = nn.LayerNorm(emb_dim, eps=1e-5)
 
     def forward(self, x):
-        mean = x.mean(dim = -1, keepdim = True)
-        var = x.var(dim = -1, keepdim=True, unbiased = False)
-        norm_x = (x - mean) / torch.sqrt(var + self.eps)
-        return self.scale * norm_x + self.shift
+        return self.norm(x)
     
 class GELU(nn.Module):
     def __init__(self):
@@ -168,7 +120,6 @@ class TransformerBlock(nn.Module):
             context_length = cfg["context_length"],
             num_heads = cfg["n_heads"],
             dropout = cfg["drop_rate"],
-            qkv_bias = cfg["qkv_bias"]
         )
 
         self.ff = FeedForward(cfg)
@@ -233,198 +184,186 @@ def load_weights_from_gpt2(our_model, gpt2_model):
     our_state_dict = our_model.state_dict()
     gpt2_state_dict = gpt2_model.state_dict()
 
-    # mapping layer names correctly
-    key_map = {
-        'token_emb.weight' : 'transformer.wte.weight',
-        'pos_emb.weight' : 'transformer.wpe.weight',
-        'out_head.weight' : 'lm_head.weight',
-        'final_norm.scale' : 'transformer.ln_f.weight',
-        'final_norm.shift' : 'transformer.ln_f.bias',
+    # mapping embeddings and layers
+    simple_map = {
+        'token_emb.weight': 'transformer.wte.weight',
+        'pos_emb.weight': 'transformer.wpe.weight',
+        'out_head.weight': 'lm_head.weight',
+        'final_norm.norm.weight': 'transformer.ln_f.weight',
+        'final_norm.norm.bias': 'transformer.ln_f.bias',
     }
+    for our_key, gpt2_key in simple_map.items():
+        if gpt2_key in gpt2_state_dict:
+            our_state_dict[our_key].copy_(gpt2_state_dict[gpt2_key])
 
-    # map the transformer block
-    for i in range(our_model.trf_blocks.__len__()):
-        key_map[f'trf_blocks.{i}.att.W_query.weight'] = f'transformer.h.{i}.attn.c_attn.weight'
-        key_map[f'trf_blocks.{i}.att.W_key.weight'] = f'transformer.h.{i}.attn.c_attn.weight'
-        key_map[f'trf_blocks.{i}.att.W_value.weight'] = f'transformer.h.{i}.attn.c_attn.weight'
-        key_map[f'trf_blocks.{i}.att.out_proj.weight'] = f'transformer.h.{i}.attn.c_proj.weight'
-        key_map[f'trf_blocks.{i}.att.out_proj.bias'] = f'transformer.h.{i}.attn.c_proj.bias'
-        key_map[f'trf_blocks.{i}.norm1.scale'] = f'transformer.h.{i}.ln_1.weight'
-        key_map[f'trf_blocks.{i}.norm1.shift'] = f'transformer.h.{i}.ln_1.bias'
-        key_map[f'trf_blocks.{i}.ff.layers.0.weight'] = f'transformer.h.{i}.mlp.c_fc.weight'
-        key_map[f'trf_blocks.{i}.ff.layers.0.bias'] = f'transformer.h.{i}.mlp.c_fc.bias'
-        key_map[f'trf_blocks.{i}.ff.layers.2.weight'] = f'transformer.h.{i}.mlp.c_proj.weight'
-        key_map[f'trf_blocks.{i}.ff.layers.2.bias'] = f'transformer.h.{i}.mlp.c_proj.bias'
-        key_map[f'trf_blocks.{i}.norm2.scale'] = f'transformer.h.{i}.ln_2.weight'
-        key_map[f'trf_blocks.{i}.norm2.shift'] = f'transformer.h.{i}.ln_2.bias'
+    # map transformer blocks
+    for i in range(len(our_model.trf_blocks)):
+        emb_dim = our_model.token_emb.weight.shape[1]
+        # QKV weights and biases
+        qkv_w = gpt2_state_dict[f'transformer.h.{i}.attn.c_attn.weight']
+        qkv_b = gpt2_state_dict[f'transformer.h.{i}.attn.c_attn.bias']
 
-    for our_key, gpt2_key in key_map.items():
-        if "att.W_" in our_key: # handle the combined QKV weights
-            # the pretrained model combines Q, K, and V weights into one tensor, we need to split it
-            qkv_weights = gpt2_state_dict[gpt2_key]
-            emb_dim = our_model.token_emb.weight.shape[1]
-            q_w, k_w, v_w = qkv_weights.split(emb_dim, dim=1)
+        # GPT2 has QKV in a combined matrix, so split it
+        q_w, k_w, v_w = qkv_w.split(emb_dim, dim=1)
+        q_b, k_b, v_b = qkv_b.split(emb_dim, dim=0)
 
-            if "W_query" in our_key:
-                our_state_dict[our_key].copy_(q_w.mT)
-            if "W_key" in our_key:
-                our_state_dict[our_key].copy_(k_w.mT)
-            if "W_value" in our_key:
-                our_state_dict[our_key].copy_(v_w.mT)
+        our_state_dict[f'trf_blocks.{i}.att.W_query.weight'].copy_(q_w.T)
+        our_state_dict[f'trf_blocks.{i}.att.W_key.weight'].copy_(k_w.T)
+        our_state_dict[f'trf_blocks.{i}.att.W_value.weight'].copy_(v_w.T)
 
-        elif gpt2_key in gpt2_state_dict:
-            # for linear layers, we need to transpose the weights
-            if our_state_dict[our_key].shape == gpt2_state_dict[gpt2_key].T.shape:
-                our_state_dict[our_key].copy_(gpt2_state_dict[gpt2_key].T)
-            else:
-                our_state_dict[our_key].copy_(gpt2_state_dict[gpt2_key])
+        our_state_dict[f'trf_blocks.{i}.att.W_query.bias'].copy_(q_b)
+        our_state_dict[f'trf_blocks.{i}.att.W_key.bias'].copy_(k_b)
+        our_state_dict[f'trf_blocks.{i}.att.W_value.bias'].copy_(v_b)
+
+        # Attention output projection
+        our_state_dict[f'trf_blocks.{i}.att.out_proj.weight'].copy_(gpt2_state_dict[f'transformer.h.{i}.attn.c_proj.weight'].T)
+        our_state_dict[f'trf_blocks.{i}.att.out_proj.bias'].copy_(gpt2_state_dict[f'transformer.h.{i}.attn.c_proj.bias'])
+
+        # LayerNorm
+        our_state_dict[f'trf_blocks.{i}.norm1.norm.weight'].copy_(gpt2_state_dict[f'transformer.h.{i}.ln_1.weight'])
+        our_state_dict[f'trf_blocks.{i}.norm1.norm.bias'].copy_(gpt2_state_dict[f'transformer.h.{i}.ln_1.bias'])
+        our_state_dict[f'trf_blocks.{i}.norm2.norm.weight'].copy_(gpt2_state_dict[f'transformer.h.{i}.ln_2.weight'])
+        our_state_dict[f'trf_blocks.{i}.norm2.norm.bias'].copy_(gpt2_state_dict[f'transformer.h.{i}.ln_2.bias'])
+
+        # Feed-Forward
+        our_state_dict[f'trf_blocks.{i}.ff.layers.0.weight'].copy_(gpt2_state_dict[f'transformer.h.{i}.mlp.c_fc.weight'].T)
+        our_state_dict[f'trf_blocks.{i}.ff.layers.0.bias'].copy_(gpt2_state_dict[f'transformer.h.{i}.mlp.c_fc.bias'])
+        our_state_dict[f'trf_blocks.{i}.ff.layers.2.weight'].copy_(gpt2_state_dict[f'transformer.h.{i}.mlp.c_proj.weight'].T)
+        our_state_dict[f'trf_blocks.{i}.ff.layers.2.bias'].copy_(gpt2_state_dict[f'transformer.h.{i}.mlp.c_proj.bias'])
 
     our_model.load_state_dict(our_state_dict)
     return our_model
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-# Training loop
-# we'll put training-specific settings here
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model_config["device"] = device
-print(f"using device: {device}")
-
-# create a dataloader instance
-# dataloader = create_dataloader(raw_text, batch_size=8, max_length=model_config["context_length"], stride=model_config["context_length"], shuffle=False)
-dataloader = create_dataloader(raw_text, batch_size=8, max_length=model_config["context_length"], stride=model_config["context_length"], shuffle=False)
-data_iter = iter(dataloader)
-inputs, targets = next(data_iter)
-
-n = len(raw_text)
-train_text = raw_text[:int(n*0.9)]
-val_text = raw_text[int(n*0.9):]
-
-# create datalaoders for train and validation sets
-train_loader = create_dataloader(
-    train_text,
-    batch_size=8,
-    max_length=model_config["context_length"],
-    stride=model_config["context_length"],
-    shuffle=True,
-    drop_last=True
-)
-
-val_loader = create_dataloader(
-    val_text,
-    batch_size=8,
-    max_length=model_config["context_length"],
-    stride=model_config["context_length"],
-    shuffle=False,
-    drop_last=False
-)
-
-# initialize model, optimizer, and dataloader
-# initialize our model and the pre-trained GPT-2 model
-model = GPTModel(model_config)
-gpt2 = GPT2LMHeadModel.from_pretrained("gpt2")
-
-# load the weights
-print("loading weights from pre-trained GPT-2...")
-model = load_weights_from_gpt2(model, gpt2)
-print("Weights loaded successfully!")
-model.to(device) # mode model to gpu
-
-optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005)
-
-# the training function
-def train_model(model, dataloader, val_loader, optimizer, device, num_epochs):
-    train_losses, val_losses = [], []
-
-    for epoch in range(num_epochs):
-        model.train() # set the model to training mode
-        total_train_loss = 0
-        for inputs, targets in dataloader:
-            # move data to the selected device (GPU)
-            inputs, targets = inputs.to(device), targets.to(device)
-
-            optimizer.zero_grad()
-
-            # forward pass: get model predictions
-            logits = model(inputs)
-
-            # calculate the loss
-            # we need to reshape logits and targets for the loss function
-            loss = nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1)
-            )
-
-            # backward pass: compute gradients
-            # optimizer.zero_grad() # reset gradients from previous step
-            loss.backward()
-
-            # update the weights
-            optimizer.step()
-
-            total_train_loss += loss.item()
-        
-        avg_train_loss = total_train_loss / len(train_loader)
-        train_losses.append(avg_train_loss)
-
-        # validation phase
-        avg_val_loss = calculate_loss(model, val_loader, device)
-        val_losses.append(avg_val_loss)
-
-        print(f"Epoch {epoch+1}/{num_epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
-
-
-        # print average loss for the epoch
-        # print(f"epoch {epoch+1}/{num_epochs}, average loss: {total_loss / len(dataloader):.4f}")
-
-    return train_losses, val_losses
-
-# run the training
-train_losses, val_losses = train_model(model, train_loader, val_loader, optimizer, device, num_epochs=20)
-
 # Generate Function
-
-def generate_text(model, tokenizer, device, context, max_new_tokens):
+def generate_text(
+    model,
+    tokenizer,
+    device,
+    context,
+    max_new_tokens,
+    context_length,
+    temperature=0.8,
+    top_k=50,
+    top_p=1.0,
+    repetition_penalty=1.2,
+    no_repeat_ngram_size=3,
+):
     # encode the input context
     in_ids = tokenizer.encode(context)
-    in_tensor = torch.tensor(in_ids).unsqueeze(0).to(device)
+    in_tensor = torch.tensor(in_ids, dtype=torch.long).unsqueeze(0).to(device)
 
-    # put the model in evaluation mode
     model.eval()
+    with torch.no_grad():
+        generated_tokens = in_ids.copy()  # keep track of generated token ids
+        for _ in range(max_new_tokens):
+            # truncate input to context length
+            in_tensor_trunc = in_tensor[:, -context_length:]
 
-    # generate tokens in a loop
-    with torch.no_grad(): # disable gradient calculation for efficiency
-        for i in range(max_new_tokens):
-            print(f'generating token {i+1}/{max_new_tokens}...')
-            # get the logits from the model
-            logits = model(in_tensor)
+            # forward pass
+            logits = model(in_tensor_trunc)
+            logits = logits[:, -1, :]  # last token logits
 
-            # focus only on the last token's logits
-            logits = logits[:, -1, :]
+            # apply repetition penalty
+            if repetition_penalty != 1.0:
+                for token_id in set(generated_tokens):
+                    if logits[0, token_id] > 0:
+                        logits[0, token_id] /= repetition_penalty
+                    else:
+                        logits[0, token_id] *= repetition_penalty
 
-            # find the token with the highest probability (greedy decoding)
-            next_token_id = torch.argmax(logits, dim=-1, keepdim=True)
+            # apply no-repeat ngram filtering
+            if no_repeat_ngram_size > 1 and len(generated_tokens) >= no_repeat_ngram_size - 1:
+                prev_ngram = tuple(generated_tokens[-(no_repeat_ngram_size-1):])
+                banned_tokens = set()
+                for i in range(len(generated_tokens) - (no_repeat_ngram_size-1)):
+                    if tuple(generated_tokens[i:i+(no_repeat_ngram_size-1)]) == prev_ngram:
+                        banned_tokens.add(generated_tokens[i + (no_repeat_ngram_size-1)])
+                for token_id in banned_tokens:
+                    logits[0, token_id] = -float('inf')
 
-            # append the new token to our input sequence
-            in_tensor = torch.cat((in_tensor, next_token_id) , dim=1)
+            # temperature scaling
+            if temperature > 0:
+                logits = logits / temperature
+                probs = torch.softmax(logits, dim=-1)
 
-        # decode the final sequence of token ID's back to text
-        return tokenizer.decode(in_tensor.squeeze(0).tolist())
+                # top-k filtering
+                if top_k > 0:
+                    top_k = min(top_k, probs.shape[-1])
+                    top_k_probs, top_k_indices = torch.topk(probs, top_k)
+                    probs = torch.zeros_like(probs).scatter_(-1, top_k_indices, top_k_probs)
 
-# testing
-tokenizer = tiktoken.get_encoding("gpt2")
-start_context = "Hello, I am"
+                # top-p (nucleus) filtering
+                if top_p < 1.0:
+                    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+                    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    sorted_probs[sorted_indices_to_remove] = 0.0
+                    probs = torch.zeros_like(probs).scatter_(-1, sorted_indices, sorted_probs)
 
-# generate 20 new tokens based on the start_context
-generated_text = generate_text(
-    model=model,
-    tokenizer=tokenizer,
-    device=device,
-    context=start_context,
-    max_new_tokens=20
-)
+                next_token_id = torch.multinomial(probs, num_samples=1)
+            else:
+                # greedy decoding
+                next_token_id = torch.argmax(logits, dim=-1, keepdim=True)
 
-print("\n--- Generated Text ---")
-print(generated_text)
+            # append next token
+            in_tensor = torch.cat((in_tensor, next_token_id), dim=1)
+            generated_tokens.append(next_token_id.item())
 
-# ================================================================================================
+    # decode the final sequence
+    return tokenizer.decode(generated_tokens)
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+if __name__ == '__main__':
+    # model configuration
+    # these values are for a GPT-2 small (124M) model
+    model_config = {
+        "vocab_size": 50257,    # vocabulary size
+        "context_length": 1024, # context length (smaller right now fro training)
+        "emb_dim": 768,         # embedding dimension
+        "n_heads": 12,          # number of attention heads
+        "n_layers": 12,         # number of layers
+        "drop_rate": 0.1,       # dropout rate
+        "qkv_bias": False,      # query-key-value bias
+    }
+
+    # we'll put training-specific settings here
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # model_config["device"] = device
+    print(f"using device: {device}")
+
+    # initialize our model and the pre-trained GPT-2 model
+    torch.manual_seed(123) # for reproducibility
+    model = GPTModel(model_config)
+    gpt2 = GPT2LMHeadModel.from_pretrained("gpt2")
+
+    # load the weights
+    print("loading weights from pre-trained GPT-2...")
+    model = load_weights_from_gpt2(model, gpt2)
+    model.to(device) # mode model to gpu
+    print("Weights loaded successfully!")
+
+    # testing
+    # tokenizer = tiktoken.get_encoding("gpt2")
+    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+    # start_context = "The trial had taken place in a small, remote town in the north"
+
+    # generate 20 new tokens based on the start_context
+    generated_text = generate_text(
+        model, tokenizer, device,
+        context="The trial had taken place in a small, remote town in the north",
+        max_new_tokens=60,
+        context_length=128,
+        temperature=1.0,
+        top_k=100,
+        top_p=0.9,
+        repetition_penalty=1.2,
+        no_repeat_ngram_size=3,
+    )
+
+    print("\n--- Generated Text ---")
+    print(generated_text)
+
+    # ================================================================================================
