@@ -1,9 +1,33 @@
 import torch
-import tiktoken
+import os
+import time
 from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
+import torch.optim as optim
+from torch.optim import AdamW
 from transformers import GPT2LMHeadModel
 from transformers import GPT2TokenizerFast
+from transformers import get_linear_schedule_with_warmup
+
+class PairedDataset(Dataset):
+    def __init__(self, examples, tokenizer, max_len=128):
+        # examples: list of dicts like [{"article": "...", "summary": "..."}]
+        self.examples = examples
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        article = self.examples[idx]["article"]
+        summary = self.examples[idx]["summary"]
+
+        # tokenize both
+        article_ids = self.tokenizer.encode(article, max_length=self.max_len, truncation = True)
+        summary_ids = self.tokenizer.encode(summary, max_length=self.max_len, truncation = True)
+
+        return article_ids, summary_ids
 
 class GPTdataset(Dataset):
     def __init__(self, txt, tokenizer, max_length, stride):
@@ -26,24 +50,79 @@ class GPTdataset(Dataset):
     def __getitem__(self, idx):
         return self.input_ids[idx], self.target_ids[idx]
 
-def create_dataloader(txt, batch_size = 4, max_length = 256, stride = 128, shuffle = True, drop_last = True):
+def create_dataloader_txt(txt, batch_size = 2, max_length = 256, stride = 128, shuffle = True, drop_last = True, val_split=0.1):
 
     # initialize the tokenizer
-    tokenizer = tiktoken.get_encoding("gpt2")
+    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+    tokenizer.pad_token = tokenizer.eos_token
 
     # create dataset
     dataset = GPTdataset(txt, tokenizer, max_length, stride)
 
+    # calculate split sizes
+    val_size = int(len(dataset) * val_split)
+    train_size = len(dataset) - val_size
+
+    # split dataset
+    # train_dataset, val_dataset = random_split(dataset, [train_size, val_size])    # need to import random_split for this
+    train_dataset = torch.utils.data.Subset(dataset, range(train_size))
+    val_dataset = torch.utils.data.Subset(dataset, range(train_size, len(dataset)))
+
     # create dataloader
-    dataloader = DataLoader(
-        dataset,
+    train_loader = DataLoader(
+        train_dataset,
         batch_size = batch_size,
         shuffle = shuffle,
+        collate_fn=lambda batch: collate_fn_paired(batch, pad_id=tokenizer.eos_token_id),
         drop_last = drop_last,
     )
-    return dataloader
 
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size = batch_size,
+        shuffle = False,
+        collate_fn=lambda batch: collate_fn_paired(batch, pad_id=tokenizer.eos_token_id),
+        drop_last = False,
+    )
 
+    # return train_loader, val_loader, tokenizer
+    return train_loader, val_loader
+
+def create_dataloader_pairs(examples, batch_size = 2, max_length = 256, stride = 128, shuffle = True, drop_last = True, val_split=0.1):
+
+    # initialize the tokenizer
+    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+    tokenizer.pad_token = tokenizer.eos_token
+
+    # create dataset
+    dataset = PairedDataset(examples, tokenizer, max_len=128)
+    # calculate split sizes
+    val_size = int(len(dataset) * val_split)
+    train_size = len(dataset) - val_size
+
+    # split dataset
+    # train_dataset, val_dataset = random_split(dataset, [train_size, val_size])    # need to import random_split for this
+    train_dataset = torch.utils.data.Subset(dataset, range(train_size))
+    val_dataset = torch.utils.data.Subset(dataset, range(train_size, len(dataset)))
+
+     # create dataloader
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size = batch_size,
+        shuffle = shuffle,
+        collate_fn=lambda batch: collate_fn_paired(batch, pad_id=tokenizer.eos_token_id),
+        drop_last = drop_last,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size = batch_size,
+        shuffle = False,
+        collate_fn=lambda batch: collate_fn_paired(batch, pad_id=tokenizer.eos_token_id),
+        drop_last = False,
+    )
+
+    return train_loader, val_loader
     
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_in, d_out, context_length, num_heads, dropout=0.1):
@@ -180,6 +259,62 @@ class GPTModel(nn.Module):
 
         return logits
     
+def collate_fn_paired(batch, pad_id):
+    # batch: list of (article_ids, summary_ids)
+    # pad_id: ID used for padding (usually tokenizer.eos_token_id)
+
+    input_ids, labels = [], []
+
+    for article_ids, summary_ids in batch:
+        # format: [ARTICLE] + [SUMMARY]
+        ids = article_ids + [pad_id] + summary_ids
+        lbls = [-100] * len(article_ids) + [-100] + summary_ids # -100 = ignore
+
+        input_ids.append(ids)
+        labels.append(lbls)
+
+    # pad to equal length
+    max_len = max(len(x) for x in input_ids)
+    for i in range(len(input_ids)):
+        while len(input_ids[i]) < max_len:
+            input_ids[i].append(pad_id)
+            labels[i].append(-100)
+
+    return torch.tensor(input_ids), torch.tensor(labels)
+     
+# def compute_loss(model, input_ids, labels):
+#     # forward pass
+#     logits = model(input_ids)
+    
+#     # reshape so loss can comapare predictions vs labels
+#     # CrossEntropyLos expects [batch*vocab, vocab_size] vs [batch*vocab]
+#     vocab_size = logits.size(-1)
+#     loss_fn = nn.CrossEntropyLoss()
+
+#     loss = loss_fn(
+#         logits.view(-1, vocab_size),    # [batch*seq_len, vocab_size]
+#         labels.view(-1)                 # [batch*seq_len]
+#     )
+
+#     return loss
+
+# def training_step(model, input_ids, labels, optimizer):
+#     # runs one training step: forward, loss, backward, optimizer update
+
+#     # zero out old gradients
+#     optimizer.zero_grad()
+
+#     # forward + loss
+#     loss = compute_loss(model, input_ids, labels)
+
+#     # backward pass (compute gradients)
+#     loss.backward()
+
+#     # update parameters
+#     optimizer.step()
+
+#     return loss.item()
+  
 def load_weights_from_gpt2(our_model, gpt2_model):
     our_state_dict = our_model.state_dict()
     gpt2_state_dict = gpt2_model.state_dict()
@@ -233,6 +368,121 @@ def load_weights_from_gpt2(our_model, gpt2_model):
 
     our_model.load_state_dict(our_state_dict)
     return our_model
+
+def evaluate(model, val_loader, device):
+    model.eval()
+    val_loss = 0.0
+    loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+    with torch.no_grad():
+        for batch in val_loader:
+            inputs, targets = batch
+            inputs, targets = inputs.to(device), targets.to(device)
+
+            logits = model(inputs)
+            V = logits.size(-1)
+            loss = loss_fn(logits.view(-1, V), targets.view(-1))
+            val_loss += loss.item()
+    return val_loss / len(val_loader)
+
+def train_loop(model, train_loader, val_loader, tokenizer, device, epochs=3, lr=5e-5, print_every=10, save_every=1, ckpt_dir="checkpoints", gen_prompt=None, gen_max_new_tokens=60, context_length=128, grad_accum_steps=1, weight_decay=0.01, warmup_ratio=0.05, max_grad_norm=1.0):
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    # move model to device
+    model.to(device)
+
+    # create optimizer (AdamW is standard for transformers)
+    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    model.train() # set model to training mode (enables dropout etc.)
+
+    # total steps for scheduler (account for grad accumulation)
+    steps_per_epoch = max(1, len(train_loader))
+    total_steps = (steps_per_epoch * epochs)  // max(1, grad_accum_steps)
+    warmup_steps = int(total_steps * warmup_ratio)
+
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
+
+    loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+
+    global_step = 0
+    # t0 = time.time()
+
+    for epoch in range(1, epochs+1):
+        epoch_start = time.time()
+        total_train_loss = 0.0
+        model.train()
+
+        for step, batch in enumerate(train_loader, start=1):
+            # dataloader should yield (input_ids, labels)
+            input_ids, labels = batch
+
+            # move batch to device
+            input_ids = input_ids.to(device)
+            labels = labels.to(device)
+
+            logits = model(input_ids)
+            V = logits.size(-1)
+            # compare multiple predictions with their ground truths
+            loss = loss_fn(logits.view(-1, V), labels.view(-1))
+            # divide loss by steps or the loss would be into steps times big
+            loss = loss / grad_accum_steps
+            # compute gradients and store in memory until optmizer is called
+            loss.backward()
+
+            # gradient accumulation step
+            if (step % grad_accum_steps) == 0:
+                global_step += 1
+                # clip grads, optimizer step, scheduler
+                nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                optimizer.step()
+                scheduler.step()
+                # update model weights using the stored goals
+                optimizer.zero_grad()
+
+                # accumulate loss for reporting
+                total_train_loss += loss.item() * grad_accum_steps
+
+                # epoch_loss = (loss.item() * grad_accum_steps) # unscale for logging
+
+                # per=step logging (every print_every accumulation-steps)
+                if global_step % print_every == 0:
+                    avg_so_far = total_train_loss / global_step
+                    print(f'[Epoch {epoch}/{epochs}][Global Step {global_step}] avg_loss_so_far={avg_so_far:.4f}')
+
+        # end of epoch
+        avg_train_loss = total_train_loss / max(1, steps_per_epoch //grad_accum_steps)
+        avg_val_loss = evaluate(model, val_loader, device)
+        epoch_time= time.time() - epoch_start
+        print(f' == Epoch {epoch}/{epochs} finished | avg_train_loss={avg_train_loss:.4f} | avg_val_loss={avg_val_loss:.4f} | time={epoch_time:.1f}s ===')
+
+        # save checkpoint per epoch (or every N epochs)
+        if (epoch % save_every) == 0:
+            ckpt_path = os.path.join(ckpt_dir, f'ckpt_step{global_step}.pt')
+            torch.save({
+                "model_state" : model.state_dict(),
+                "optimizer_state" : optimizer.state_dict(),
+                "scheduler_state" : scheduler.state_dict(),
+                "epoch" : epoch,
+                "global_step" : global_step}, ckpt_path)
+            print("Saved checkpoint:", ckpt_path)
+
+        # generation sample for quick qualitative check
+        if gen_prompt is not None:
+            model.eval()
+            with torch.no_grad():
+                sample = generate_text(model=model, tokenizer=tokenizer, device=device, context=gen_prompt, max_new_tokens=gen_max_new_tokens, context_length=context_length, temperature=0.7, top_k=50, top_p=0.9, repetition_penalty=1.2, no_repeat_ngram_size=3)
+                print(f'--- Sample generation after epoch {epoch} ---\n{sample}\n')
+            model.train()
+    
+    # final save
+    final_path = os.path.join(ckpt_dir, f'final.pt')
+    torch.save({
+        "model_state" : model.state_dict(),
+        "optimizer_state" : optimizer.state_dict(),
+        "scheduler_state" : scheduler.state_dict(),
+        "epoch" : epochs,
+        "global_step" : global_step}, final_path)
+    print("Training finished. Final model saved to:", final_path)
 
 # Generate Function
 def generate_text(
@@ -317,6 +567,39 @@ def generate_text(
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 if __name__ == '__main__':
+
+    examples = [
+        {"article": "The cat sat on the mat.", "summary": "A cat sat on a mat."},
+        {"article": "The quick brown fox jumps over the lazy dog.", "summary": "A fox jumped over a dog."},
+        {"article": "The sun rises in the east and sets in the west.", "summary": "The sun moves across the sky."},
+        {"article": "Water boils at 100 degrees Celsius.", "summary": "Water boils at high temperature."},
+        {"article": "Mount Everest is the tallest mountain in the world.", "summary": "Everest is the highest peak."},
+        {"article": "The Amazon rainforest is home to many species.", "summary": "The Amazon is rich in biodiversity."},
+        {"article": "The internet connects computers globally.", "summary": "The internet links computers worldwide."},
+        {"article": "Electric cars run on batteries instead of fuel.", "summary": "Electric cars use batteries."},
+        {"article": "Shakespeare wrote many famous plays.", "summary": "Shakespeare was a playwright."},
+        {"article": "The Earth orbits around the Sun.", "summary": "Earth revolves around the Sun."},
+        {"article": "Chocolate is made from cocoa beans.", "summary": "Cocoa beans produce chocolate."},
+        {"article": "The Great Wall of China is visible from space.", "summary": "The Great Wall is very large."},
+        {"article": "Rainforests are important for producing oxygen.", "summary": "Rainforests help make oxygen."},
+        {"article": "Basketball is played with a ball and a hoop.", "summary": "Basketball uses a hoop and ball."},
+        {"article": "Computers process information using chips.", "summary": "Chips allow computers to work."},
+        {"article": "The human body has 206 bones.", "summary": "Humans have 206 bones."},
+        {"article": "Oceans cover about 71% of Earth's surface.", "summary": "Most of Earth is ocean."},
+        {"article": "Birds can fly because of their wings.", "summary": "Wings help birds fly."},
+        {"article": "Apples grow on trees in orchards.", "summary": "Apples come from trees."},
+        {"article": "Mars is known as the Red Planet.", "summary": "Mars is the Red Planet."},
+    ]
+
+
+    # create dataloader
+    train_loader, val_loader = create_dataloader_pairs(
+        examples,
+        batch_size=2,
+        max_length=128,
+        shuffle=True,
+    )
+
     # model configuration
     # these values are for a GPT-2 small (124M) model
     model_config = {
@@ -345,25 +628,46 @@ if __name__ == '__main__':
     model.to(device) # mode model to gpu
     print("Weights loaded successfully!")
 
-    # testing
-    # tokenizer = tiktoken.get_encoding("gpt2")
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
-    # start_context = "The trial had taken place in a small, remote town in the north"
+    tokenizer.pad_token = tokenizer.eos_token
 
-    # generate 20 new tokens based on the start_context
-    generated_text = generate_text(
-        model, tokenizer, device,
-        context="The trial had taken place in a small, remote town in the north",
-        max_new_tokens=60,
+    optimizer = optim.AdamW(model.parameters(), lr=5e-5)
+
+    # dataloader = create_dataloader()
+    gen_prompt="the cat sat"
+    
+    train_loop(
+        model=model,
+        # dataloader=dataloader,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        tokenizer=tokenizer,
+        device=device,
+        epochs=3,
+        lr=5e-5,
+        print_every=2,
+        save_every=1,
+        ckpt_dir="checkpoints",
+        gen_prompt=gen_prompt,
+        gen_max_new_tokens=30,
         context_length=128,
-        temperature=1.0,
-        top_k=100,
-        top_p=0.9,
-        repetition_penalty=1.2,
-        no_repeat_ngram_size=3,
+        grad_accum_steps=1
     )
 
-    print("\n--- Generated Text ---")
-    print(generated_text)
+    # generate 20 new tokens based on the start_context
+    # generated_text = generate_text(
+    #     model, tokenizer, device,
+    #     context="The cat sat",
+    #     max_new_tokens=60,
+    #     context_length=128,
+    #     temperature=1.0,
+    #     top_k=100,
+    #     top_p=0.9,
+    #     repetition_penalty=1.2,
+    #     no_repeat_ngram_size=3,
+    # )
+
+    # print("\n--- Generated Text ---")
+    # print(generated_text)
 
     # ================================================================================================

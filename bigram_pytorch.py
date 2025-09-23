@@ -64,7 +64,7 @@ for i in range(epochs):
     Xb, Yb = Xtr[ix], Ytr[ix] # batch X, Y
 
     # forward pass
-    emb = C[Xb[ix]] # Embed the characters into vectors
+    emb = C[Xb] # Embed the characters into vectors
     embcat = emb.view(emb.shape[0], -1) # concatenate the vectors
     hpreact = embcat @ W1 + b1 # hidden layer pre-activation
     h = torch.tanh(hpreact) # hidden layer
