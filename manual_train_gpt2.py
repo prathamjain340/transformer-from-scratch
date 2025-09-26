@@ -1,16 +1,19 @@
-import torch
 import os
 import time
-from torch.utils.data import Dataset, DataLoader
+import torch
+import random
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim import AdamW
+from datasets import load_dataset
 from transformers import GPT2LMHeadModel
 from transformers import GPT2TokenizerFast
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import Dataset, DataLoader
 from transformers import get_linear_schedule_with_warmup
 
 class PairedDataset(Dataset):
-    def __init__(self, examples, tokenizer, max_len=128):
+    def __init__(self, examples, tokenizer, max_len=512):
         # examples: list of dicts like [{"article": "...", "summary": "..."}]
         self.examples = examples
         self.tokenizer = tokenizer
@@ -20,14 +23,18 @@ class PairedDataset(Dataset):
         return len(self.examples)
 
     def __getitem__(self, idx):
-        article = self.examples[idx]["article"]
-        summary = self.examples[idx]["summary"]
+        ex = self.examples[idx]
+        inp_text = ex["input"]
+        out_text = ex["output"]
 
         # tokenize both
-        article_ids = self.tokenizer.encode(article, max_length=self.max_len, truncation = True)
-        summary_ids = self.tokenizer.encode(summary, max_length=self.max_len, truncation = True)
+        enc_inp = self.tokenizer.encode(inp_text, max_length=self.max_len, truncation = True)
+        enc_out = self.tokenizer.encode(out_text, max_length=self.max_len, truncation = True)
 
-        return article_ids, summary_ids
+        input_ids = torch.tensor(enc_inp, dtype=torch.long)
+        labels = torch.tensor(enc_out, dtype=torch.long)
+
+        return input_ids, labels
 
 class GPTdataset(Dataset):
     def __init__(self, txt, tokenizer, max_length, stride):
@@ -258,63 +265,56 @@ class GPTModel(nn.Module):
         logits = self.out_head(x) # shape: (batch_size, deq_len, vocab_size)
 
         return logits
-    
-def collate_fn_paired(batch, pad_id):
-    # batch: list of (article_ids, summary_ids)
-    # pad_id: ID used for padding (usually tokenizer.eos_token_id)
 
-    input_ids, labels = [], []
+def collate_fn_paired(batch, pad_id, label_pad_id=-100, debug=True):
+    input_ids_list = []
+    labels_list = []
 
-    for article_ids, summary_ids in batch:
-        # format: [ARTICLE] + [SUMMARY]
-        ids = article_ids + [pad_id] + summary_ids
-        lbls = [-100] * len(article_ids) + [-100] + summary_ids # -100 = ignore
+    for idx, (article_ids, summary_ids) in enumerate(batch):
+        # Ensure tensors
+        if not isinstance(article_ids, torch.Tensor):
+            article_ids = torch.tensor(article_ids, dtype=torch.long)
+        if not isinstance(summary_ids, torch.Tensor):
+            summary_ids = torch.tensor(summary_ids, dtype=torch.long)
 
-        input_ids.append(ids)
-        labels.append(lbls)
+        # Remove any padding in summary (optional, avoids all -100)
+        summary_ids = summary_ids[summary_ids != pad_id]
 
-    # pad to equal length
-    max_len = max(len(x) for x in input_ids)
-    for i in range(len(input_ids)):
-        while len(input_ids[i]) < max_len:
-            input_ids[i].append(pad_id)
-            labels[i].append(-100)
+        # Concatenate article + summary
+        input_ids = torch.cat([article_ids, summary_ids])
 
-    return torch.tensor(input_ids), torch.tensor(labels)
-     
-# def compute_loss(model, input_ids, labels):
-#     # forward pass
-#     logits = model(input_ids)
-    
-#     # reshape so loss can comapare predictions vs labels
-#     # CrossEntropyLos expects [batch*vocab, vocab_size] vs [batch*vocab]
-#     vocab_size = logits.size(-1)
-#     loss_fn = nn.CrossEntropyLoss()
+        # Mask article tokens for loss
+        labels = torch.cat([torch.full_like(article_ids, label_pad_id), summary_ids])
 
-#     loss = loss_fn(
-#         logits.view(-1, vocab_size),    # [batch*seq_len, vocab_size]
-#         labels.view(-1)                 # [batch*seq_len]
-#     )
+        input_ids_list.append(input_ids)
+        labels_list.append(labels)
 
-#     return loss
+    # Pad sequences to max length in the batch
+    inputs_padded = pad_sequence(input_ids_list, batch_first=True, padding_value=pad_id)
+    labels_padded = pad_sequence(labels_list, batch_first=True, padding_value=label_pad_id)
 
-# def training_step(model, input_ids, labels, optimizer):
-#     # runs one training step: forward, loss, backward, optimizer update
+    return inputs_padded, labels_padded
 
-#     # zero out old gradients
-#     optimizer.zero_grad()
+def make_train_val_loaders_from_examples(examples, tokenizer, batch_size=8, max_len=256, val_ratio=0.1, shuffle=True, seed=42):
+    random.seed(seed)
+    n = len(examples)
+    idxs = list(range(n))
+    random.shuffle(idxs)
+    split = int(n* (1 - val_ratio))
+    train_idx = idxs[:split]
+    val_idx = idxs[split:]
 
-#     # forward + loss
-#     loss = compute_loss(model, input_ids, labels)
+    train_examples = [examples[i] for i in train_idx]
+    val_examples = [examples[i] for i in val_idx]
 
-#     # backward pass (compute gradients)
-#     loss.backward()
+    train_ds = PairedDataset(train_examples, tokenizer, max_len=max_len)
+    val_ds = PairedDataset(val_examples, tokenizer, max_len=max_len)
 
-#     # update parameters
-#     optimizer.step()
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=shuffle, collate_fn=lambda batch: collate_fn_paired(batch, pad_id=tokenizer.eos_token_id))
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=lambda batch: collate_fn_paired(batch, pad_id=tokenizer.eos_token_id))
 
-#     return loss.item()
-  
+    return train_loader, val_loader
+
 def load_weights_from_gpt2(our_model, gpt2_model):
     our_state_dict = our_model.state_dict()
     gpt2_state_dict = gpt2_model.state_dict()
@@ -384,7 +384,7 @@ def evaluate(model, val_loader, device):
             val_loss += loss.item()
     return val_loss / len(val_loader)
 
-def train_loop(model, train_loader, val_loader, tokenizer, device, epochs=3, lr=5e-5, print_every=10, save_every=1, ckpt_dir="checkpoints", gen_prompt=None, gen_max_new_tokens=60, context_length=128, grad_accum_steps=1, weight_decay=0.01, warmup_ratio=0.05, max_grad_norm=1.0):
+def train_loop(model, train_loader, val_loader, tokenizer, device, epochs=3, lr=5e-5, print_every=10, save_every=500, ckpt_dir="checkpoints", gen_prompt=None, gen_max_new_tokens=60, context_length=128, grad_accum_steps=1, weight_decay=0.01, warmup_ratio=0.05, max_grad_norm=1.0):
     os.makedirs(ckpt_dir, exist_ok=True)
 
     # move model to device
@@ -564,41 +564,42 @@ def generate_text(
     # decode the final sequence
     return tokenizer.decode(generated_tokens)
 
+def format_example(example):
+    return{
+        "input": "summarize: " + example["article"],
+        "output": example["highlights"] 
+    }
+
+def decode_labels(labels, tokenizer, pad_id, label_pad_id=-100):
+    # Replace -100 with pad_id so tokenizer can decode
+    labels_to_decode = torch.where(labels == label_pad_id, pad_id, labels)
+    return tokenizer.decode(labels_to_decode[0], skip_special_tokens=True)
+
+def monitor_summary(model, tokenizer, sample_article, device, max_length=200, gen_prompt=None, gen_max_new_tokens=60, context_length=128):
+    model.eval()
+    with torch.no_grad():
+        prompt = f"Article: {sample_article}\n\nSummary: "
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+        output_ids = generate_text(model=model, tokenizer=tokenizer, device=device, context=gen_prompt, max_new_tokens=gen_max_new_tokens, context_length=context_length, temperature=0.7, top_k=50, top_p=0.9, repetition_penalty=1.2, no_repeat_ngram_size=3)
+        summary = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    model.train()
+    return summary
+
+
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 if __name__ == '__main__':
 
-    examples = [
-        {"article": "The cat sat on the mat.", "summary": "A cat sat on a mat."},
-        {"article": "The quick brown fox jumps over the lazy dog.", "summary": "A fox jumped over a dog."},
-        {"article": "The sun rises in the east and sets in the west.", "summary": "The sun moves across the sky."},
-        {"article": "Water boils at 100 degrees Celsius.", "summary": "Water boils at high temperature."},
-        {"article": "Mount Everest is the tallest mountain in the world.", "summary": "Everest is the highest peak."},
-        {"article": "The Amazon rainforest is home to many species.", "summary": "The Amazon is rich in biodiversity."},
-        {"article": "The internet connects computers globally.", "summary": "The internet links computers worldwide."},
-        {"article": "Electric cars run on batteries instead of fuel.", "summary": "Electric cars use batteries."},
-        {"article": "Shakespeare wrote many famous plays.", "summary": "Shakespeare was a playwright."},
-        {"article": "The Earth orbits around the Sun.", "summary": "Earth revolves around the Sun."},
-        {"article": "Chocolate is made from cocoa beans.", "summary": "Cocoa beans produce chocolate."},
-        {"article": "The Great Wall of China is visible from space.", "summary": "The Great Wall is very large."},
-        {"article": "Rainforests are important for producing oxygen.", "summary": "Rainforests help make oxygen."},
-        {"article": "Basketball is played with a ball and a hoop.", "summary": "Basketball uses a hoop and ball."},
-        {"article": "Computers process information using chips.", "summary": "Chips allow computers to work."},
-        {"article": "The human body has 206 bones.", "summary": "Humans have 206 bones."},
-        {"article": "Oceans cover about 71% of Earth's surface.", "summary": "Most of Earth is ocean."},
-        {"article": "Birds can fly because of their wings.", "summary": "Wings help birds fly."},
-        {"article": "Apples grow on trees in orchards.", "summary": "Apples come from trees."},
-        {"article": "Mars is known as the Red Planet.", "summary": "Mars is the Red Planet."},
-    ]
-
-
-    # create dataloader
-    train_loader, val_loader = create_dataloader_pairs(
-        examples,
-        batch_size=2,
-        max_length=128,
-        shuffle=True,
-    )
+    dataset = load_dataset("cnn_dailymail", "3.0.0")
+    # print(dataset)
+    # print(dataset["train"][0]) # show one example
+    formatted_datset = dataset["train"].map(format_example)
+    sample_article = """
+    (CNN) -- The silly season is upon us: the time during an election year 
+    when those trying to muck up the other side throw all sorts of nonsense 
+    about a candidate onto the public wall.
+    """
 
     # model configuration
     # these values are for a GPT-2 small (124M) model
@@ -631,43 +632,34 @@ if __name__ == '__main__':
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
 
+    # create dataloader
+    train_loader, val_loader = make_train_val_loaders_from_examples(
+        formatted_datset,
+        tokenizer,
+        batch_size=8,
+        max_len=256,
+        val_ratio=0.15,
+        shuffle=True,
+    )
+
     optimizer = optim.AdamW(model.parameters(), lr=5e-5)
 
     # dataloader = create_dataloader()
-    gen_prompt="the cat sat"
-    
     train_loop(
         model=model,
-        # dataloader=dataloader,
         train_loader=train_loader,
         val_loader=val_loader,
         tokenizer=tokenizer,
         device=device,
-        epochs=3,
+        epochs=1,
         lr=5e-5,
-        print_every=2,
+        print_every=10,
         save_every=1,
         ckpt_dir="checkpoints",
-        gen_prompt=gen_prompt,
-        gen_max_new_tokens=30,
-        context_length=128,
-        grad_accum_steps=1
+        gen_prompt="Summarize: The silly season is upon us: the time during an election year when those trying to muck up the other side throw all sorts of nonsense about a candidate onto the public wall. Hillary Clinton, because she's the Democrat's presumptive 2016 front-runner, has become the target du jour.",
+        gen_max_new_tokens=40,
+        context_length=64,
+        grad_accum_steps=8
     )
 
-    # generate 20 new tokens based on the start_context
-    # generated_text = generate_text(
-    #     model, tokenizer, device,
-    #     context="The cat sat",
-    #     max_new_tokens=60,
-    #     context_length=128,
-    #     temperature=1.0,
-    #     top_k=100,
-    #     top_p=0.9,
-    #     repetition_penalty=1.2,
-    #     no_repeat_ngram_size=3,
-    # )
-
-    # print("\n--- Generated Text ---")
-    # print(generated_text)
-
-    # ================================================================================================
+# ================================================================================================

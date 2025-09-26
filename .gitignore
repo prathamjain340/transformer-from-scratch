@@ -19,6 +19,6 @@ the-verdict.txt
 
 test.py
 
-sasa.py
-
 checkpoints/
+
+hf_checkpoints/
