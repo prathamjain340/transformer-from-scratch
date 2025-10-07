@@ -23,4 +23,14 @@ checkpoints/
 
 hf_checkpoints/
 
-flan_t5_multitask_checkpoints/
+# flan_t5_multitask_checkpoints/
+
+results/
+
+results_finetune_virattt/
+
+Financial-QA-10k.csv
+
+try.py
+
+flan_t5L_multitask_finetune.py
