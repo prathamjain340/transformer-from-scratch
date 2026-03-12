@@ -82,3 +82,22 @@ This project explores the internal mechanics of transformers by implementing the
 - NumPy
 - Deep Learning
 - Transformer Architecture
+
+---
+
+## How to Run
+
+Clone the repository
+
+```bash
+git clone https://github.com/prathamjain340/transformer-from-scratch.git
+cd transformer-from-scratch
+```
+Install dependencies
+```bash
+pip install -r requirements.txt
+```
+Run the training script
+```bash
+python train.py
+```
